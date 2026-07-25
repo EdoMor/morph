@@ -163,8 +163,14 @@ async def run_iteration(
     history: list[dict[str, Any]],
     dry_run: bool = False,
     focus: str | None = None,
+    keep_worktree: bool = False,
 ) -> Iteration:
-    """One full cycle: edit in isolation, measure, keep or revert."""
+    """One full cycle: edit in isolation, measure, keep or revert.
+
+    ``keep_worktree`` leaves the iteration's worktree and branch in place so a
+    human can inspect the diff. Off by default — otherwise every dry run
+    accumulates a branch.
+    """
     started = time.perf_counter()
     base_commit = git(repo, "rev-parse", "HEAD")
     branch = f"selfimprove/iter-{index}-{int(time.time())}"
@@ -266,7 +272,9 @@ async def run_iteration(
         return iteration
     finally:
         iteration.duration_s = time.perf_counter() - started
-        if not dry_run or not iteration.accepted:
+        if keep_worktree:
+            log.info("Worktree kept for inspection: %s (branch %s)", worktree, branch)
+        else:
             _remove_worktree(repo, worktree, branch)
 
 
@@ -320,6 +328,7 @@ async def run_loop(
     dry_run: bool = False,
     focus: str | None = None,
     history_path: Path | None = None,
+    keep_worktree: bool = False,
 ) -> list[dict[str, Any]]:
     """Run ``iterations`` improvement cycles. Returns one history entry each."""
     repo = Path(repo or REPO_ROOT)
@@ -343,6 +352,7 @@ async def run_loop(
             history=history,
             dry_run=dry_run,
             focus=focus,
+            keep_worktree=keep_worktree,
         )
         entry = iteration.to_entry()
         append_history(history_file, entry)  # R-705
@@ -373,6 +383,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--base-url")
     parser.add_argument("--focus", help="Steer this run at a specific area")
     parser.add_argument("--dry-run", action="store_true", help="Measure but never merge")
+    parser.add_argument(
+        "--keep-worktree",
+        action="store_true",
+        help="Leave each iteration's worktree and branch in place for inspection",
+    )
     parser.add_argument("--repo", default=str(REPO_ROOT))
     args = parser.parse_args(argv)
 
@@ -391,6 +406,7 @@ def main(argv: list[str] | None = None) -> int:
             repo=Path(args.repo),
             dry_run=args.dry_run,
             focus=args.focus,
+            keep_worktree=args.keep_worktree,
         )
     )
 

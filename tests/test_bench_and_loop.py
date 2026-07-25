@@ -6,6 +6,7 @@ tested directly rather than only through the conformance suite.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import subprocess
 from pathlib import Path
@@ -241,7 +242,7 @@ def test_prompt_carries_a_focus_when_given():
     assert "MCP reconnection" in prompt
 
 
-def test_history_is_ordered_newest_first():
+def test_prompt_history_is_ordered_newest_first():
     history = [
         {"accepted": False, "score_before": 10, "score_after": 9, "summary": "oldest attempt"},
         {"accepted": True, "score_before": 10, "score_after": 20, "summary": "newest attempt"},
@@ -250,3 +251,123 @@ def test_history_is_ordered_newest_first():
         requirements="x", scorecard={"composite": 20.0, "categories": {}}, feedback="y", history=history
     )
     assert prompt.index("newest attempt") < prompt.index("oldest attempt")
+
+
+# ---------------------------------------------------------------------------
+# Iteration decisions
+#
+# These drive the real loop against the real repository, with the benchmark
+# stubbed so a case costs milliseconds instead of a full scorecard run. What is
+# under test is the decision: when does an iteration get kept, and when reverted.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def iteration_harness(monkeypatch, repo_root):
+    """Run `run_iteration` with a scripted editor and a controllable score."""
+    import selfimprove.loop as loop_module
+    from morph.config import Config
+    from morph.llm.echo import EchoProvider
+
+    def _run(script, score_after: float = 100.0, gated: bool = False, **kwargs):
+        monkeypatch.setattr(
+            loop_module, "get_provider", lambda *a, **k: EchoProvider(script=script)
+        )
+
+        async def fake_measure(root, config):
+            return {"composite": score_after, "gated": gated, "categories": {}, "results": []}
+
+        monkeypatch.setattr(loop_module, "measure", fake_measure)
+
+        config = Config(workspace=repo_root, provider="echo", image_backend="stub")
+        baseline = {"composite": 50.0, "gated": False, "categories": {}, "results": []}
+        return asyncio.run(
+            loop_module.run_iteration(
+                index=99,
+                repo=repo_root,
+                config=config,
+                baseline=baseline,
+                history=[],
+                dry_run=True,
+                **kwargs,
+            )
+        )
+
+    return _run
+
+
+def test_iteration_rejected_when_nothing_changed(iteration_harness, say):
+    result = iteration_harness([say("I looked around and changed nothing.")])
+
+    assert not result.accepted
+    assert result.rejection_reason == "the agent made no changes"
+    assert result.files_changed == []
+
+
+def test_iteration_rejected_for_touching_the_goalposts(iteration_harness, call, say):
+    """R-707 in practice: editing REQUIREMENTS.md voids the whole iteration."""
+    result = iteration_harness(
+        [
+            call("write_file", path="REQUIREMENTS.md", content="R-001 be great\n"),
+            say("Simplified the requirements."),
+        ]
+    )
+
+    assert not result.accepted
+    assert "protected files" in result.rejection_reason
+    assert "REQUIREMENTS.md" in result.rejection_reason
+    assert result.score_after == 0.0, "a goalpost breach scores zero, not partial credit"
+
+
+def test_iteration_rejected_when_the_gate_is_red(iteration_harness, call, say):
+    result = iteration_harness(
+        [call("write_file", path="NOTES.md", content="x"), say("Edited.")],
+        score_after=90.0,
+        gated=True,
+    )
+
+    assert not result.accepted
+    assert "conformance suite is failing" in result.rejection_reason
+
+
+def test_iteration_rejected_on_score_regression(iteration_harness, call, say):
+    result = iteration_harness(
+        [call("write_file", path="NOTES.md", content="x"), say("Edited.")],
+        score_after=49.9,
+    )
+
+    assert not result.accepted
+    assert "regressed" in result.rejection_reason
+
+
+def test_iteration_accepted_when_the_score_holds_or_improves(iteration_harness, call, say):
+    result = iteration_harness(
+        [call("write_file", path="NOTES.md", content="# Notes\n"), say("Added NOTES.md.")],
+        score_after=61.0,
+    )
+
+    assert result.accepted
+    assert result.files_changed == ["NOTES.md"]
+    assert result.score_after == 61.0
+    assert "Added NOTES.md." in result.summary
+
+
+def test_iteration_leaves_no_worktree_or_branch_behind(iteration_harness, repo_root, say):
+    """Every iteration cleans up after itself, accepted or not."""
+    import subprocess as sp
+
+    iteration_harness([say("Nothing to do.")])
+
+    worktrees = sp.run(
+        ["git", "worktree", "list"], cwd=repo_root, capture_output=True, text=True, check=True
+    ).stdout
+    branches = sp.run(
+        ["git", "branch", "--list", "selfimprove/*"],
+        cwd=repo_root,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+
+    assert "selfimprove" not in worktrees
+    assert branches.strip() == ""

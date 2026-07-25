@@ -263,9 +263,15 @@ async def run_capability_suites(
     suite = None
 
     for index, task in enumerate(tasks, 1):
-        if tracer and task.category != suite:
+        if task.category != suite:
             suite = task.category
-            tracer.header(f"{suite} suite")
+            if tracer:
+                tracer.header(f"{suite} suite")
+            # One line per suite, not per task: measuring is most of a run's wall
+            # time, and forty task rows per pass would bury the agent's own steps
+            # in the live view's bounded window (R-721).
+            if progress is not None and progress.events is not None:
+                progress.events.append("phase", f"benchmark: {suite} suite", phase="measuring")
         if progress:
             progress.update(activity=f"benchmark {index}/{len(tasks)}: {task.label}")
 

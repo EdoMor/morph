@@ -326,7 +326,7 @@ def iteration_harness(monkeypatch, repo_root, tmp_path):
             loop_module, "get_provider", lambda *a, **k: EchoProvider(script=script)
         )
 
-        async def fake_measure(root, config):
+        async def fake_measure(root, config, progress=None):
             return {"composite": score_after, "gated": gated, "categories": {}, "results": []}
 
         monkeypatch.setattr(loop_module, "measure", fake_measure)

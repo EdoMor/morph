@@ -1926,6 +1926,46 @@ def test_R_721_live_publisher_cannot_touch_real_branches_or_the_worktree(tmp_pat
     assert (repo / "code.py").read_text("utf-8") == "edited but not committed\n"
 
 
+async def test_R_721_measuring_keeps_the_live_view_moving(tmp_path, config):
+    """Scoring is most of a run's wall time; a blank hour reads as a stall.
+
+    Run #5 spent 54 of its 70 minutes in the baseline benchmark. The loop was not
+    passing its heartbeat down, so the dashboard showed one line — "scoring the
+    current code" — for the whole of it.
+    """
+    import inspect
+
+    from bench.runner import run_capability_suites
+    from bench.scorecard import Scorecard
+    from morph.trace import EventLog, ProgressFile
+    from selfimprove.loop import measure
+
+    # The loop must offer the heartbeat to the benchmark, at every call site.
+    assert "progress" in inspect.signature(measure).parameters
+    loop_source = (REPO_ROOT / "selfimprove" / "loop.py").read_text("utf-8")
+    calls = re.findall(r"await measure\([^)]*\)", loop_source)
+    assert calls, "the loop must measure something"
+    assert all("progress=progress" in call for call in calls), (
+        f"a measure() call is not reporting progress: {[c for c in calls if 'progress' not in c]}"
+    )
+
+    progress = ProgressFile(tmp_path / "progress.json", events=EventLog(tmp_path / "trace.jsonl"))
+    await run_capability_suites(Scorecard(), config, only="skills", progress=progress)
+
+    assert "benchmark" in progress.state["activity"], "the heartbeat must name the task"
+
+    records = [
+        json.loads(line)
+        for line in (tmp_path / "trace.jsonl").read_text("utf-8").splitlines()
+        if line.strip()
+    ]
+    suites = [r for r in records if r["kind"] == "phase" and "suite" in r["text"]]
+    assert suites, "the live view must show which suite is being measured"
+    # One row per suite, not per task: forty task rows a pass would bury the
+    # agent's own steps in the bounded window.
+    assert len(suites) == len({r["text"] for r in suites})
+
+
 def test_R_721_the_test_suite_cannot_clobber_a_live_runs_heartbeat():
     """Found in flight: status.json on the live branch read `iteration: 99`.
 

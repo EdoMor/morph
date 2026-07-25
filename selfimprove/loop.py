@@ -137,8 +137,17 @@ def _agent_config(root: Path, config: Config) -> Config:
     )
 
 
-async def measure(root: Path, config: Config) -> dict[str, Any]:
-    scorecard = await run_benchmark(_bench_config(root, config), repo=root)
+async def measure(
+    root: Path, config: Config, progress: ProgressFile | None = None
+) -> dict[str, Any]:
+    """Score ``root``. Pass ``progress`` to keep the live view moving.
+
+    Measuring against a real model is most of a run's wall time — the baseline
+    alone took 54 minutes of run #5's 70. Without the heartbeat threaded through,
+    the dashboard shows a single "scoring the current code" line for the best
+    part of an hour and looks stalled (R-718, R-721).
+    """
+    scorecard = await run_benchmark(_bench_config(root, config), repo=root, progress=progress)
     return scorecard.to_dict()
 
 
@@ -265,7 +274,7 @@ async def run_iteration(
 
         tracer.note(f"changed {len(iteration.files_changed)} file(s); re-measuring")
         progress.update(phase="measuring", activity="running the benchmark on the result")
-        after = await measure(worktree, config)
+        after = await measure(worktree, config, progress=progress)
         iteration.score_after = after.get("composite", 0.0)
         iteration.deltas = compare(baseline, after)
 
@@ -479,7 +488,7 @@ async def run_loop(
 
     tracer = TraceRenderer()
     tracer.header(f"baseline — {cfg.provider}/{cfg.model}")
-    baseline = await measure(repo, cfg)
+    baseline = await measure(repo, cfg, progress=progress)
     log.info("Baseline score: %.1f", baseline.get("composite", 0.0))
     tracer.note(f"baseline composite {baseline.get('composite', 0.0):.1f}")
 
@@ -512,7 +521,7 @@ async def run_loop(
 
         if iteration.accepted and not dry_run:
             progress.update(phase="measuring", activity="re-scoring after acceptance")
-            baseline = await measure(repo, cfg)
+            baseline = await measure(repo, cfg, progress=progress)
 
     progress.update(phase="done", activity=f"{sum(1 for e in entries if e['accepted'])}"
                     f"/{len(entries)} accepted")

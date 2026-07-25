@@ -185,7 +185,12 @@ async def run_iteration(
     worktree = _create_worktree(repo, branch, base_commit)
 
     tracer = TraceRenderer()
-    progress = progress_file or ProgressFile(PROGRESS_PATH)
+    # Relative to the repository being worked on, not to this module's location.
+    # PROGRESS_PATH points at the real checkout, so defaulting to it meant the
+    # conformance suite — which drives run_iteration with a scratch repo, and
+    # which the benchmark runs on every pass — overwrote the live heartbeat of
+    # whatever run was in flight, and dirtied a file the loop commits.
+    progress = progress_file or ProgressFile(Path(repo) / "selfimprove" / "progress.json")
     tracer.header(f"iteration {index} — {config.provider}/{config.model}")
     tracer.note(f"base {base_commit[:8]}, score to beat {baseline.get('composite', 0):.1f}")
     progress.update(

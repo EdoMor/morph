@@ -1926,6 +1926,34 @@ def test_R_721_live_publisher_cannot_touch_real_branches_or_the_worktree(tmp_pat
     assert (repo / "code.py").read_text("utf-8") == "edited but not committed\n"
 
 
+def test_R_721_the_test_suite_cannot_clobber_a_live_runs_heartbeat():
+    """Found in flight: status.json on the live branch read `iteration: 99`.
+
+    That is this suite's own fixture. `run_iteration` defaulted its heartbeat to
+    the module's REPO_ROOT, and the benchmark runs the conformance suite on every
+    pass — so measuring a run overwrote the progress file of the run doing the
+    measuring, and dirtied a file the loop commits.
+    """
+    loop_source = (REPO_ROOT / "selfimprove" / "loop.py").read_text("utf-8")
+    default = 'progress_file or ProgressFile(Path(repo) / "selfimprove" / "progress.json")'
+    assert default in loop_source, "the heartbeat path must follow the repo being worked on"
+
+    # And the harness that drives iterations against the real repository — it
+    # needs real worktrees — must still keep its heartbeat out of it.
+    harness = (REPO_ROOT / "tests" / "test_bench_and_loop.py").read_text("utf-8")
+    assert 'kwargs.setdefault("progress_file"' in harness
+
+    # Nothing may be checked in at those paths: they are per-run scratch.
+    tracked = subprocess.run(
+        ["git", "ls-files", "selfimprove/progress.json", "selfimprove/live-trace.jsonl"],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    ).stdout.strip()
+    assert not tracked, f"per-run scratch must not be committed: {tracked}"
+
+
 def test_R_721_dashboard_reads_the_live_branch_without_a_deploy():
     """Pages redeploys at the end of a run; the live view must not wait for that."""
     app = (REPO_ROOT / "site" / "app.js").read_text("utf-8")

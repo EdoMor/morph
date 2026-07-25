@@ -309,13 +309,19 @@ def test_prompt_history_is_ordered_newest_first():
 
 
 @pytest.fixture
-def iteration_harness(monkeypatch, repo_root):
+def iteration_harness(monkeypatch, repo_root, tmp_path):
     """Run `run_iteration` with a scripted editor and a controllable score."""
     import selfimprove.loop as loop_module
     from morph.config import Config
     from morph.llm.echo import EchoProvider
+    from morph.trace import ProgressFile
 
     def _run(script, score_after: float = 100.0, gated: bool = False, **kwargs):
+        # These iterations run against the real repository, because they need
+        # real worktrees — so their heartbeat must go somewhere else. Without
+        # this the suite overwrites the progress file of any run in flight, and
+        # the benchmark runs this suite on every pass.
+        kwargs.setdefault("progress_file", ProgressFile(tmp_path / "progress.json"))
         monkeypatch.setattr(
             loop_module, "get_provider", lambda *a, **k: EchoProvider(script=script)
         )

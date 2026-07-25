@@ -2153,6 +2153,19 @@ def test_R_720_a_plan_is_not_an_answer(config, registry):
     ):
         assert classify(claim) == "claim", f"missed a false report: {claim[:60]}"
 
+    # Run #8, iteration 1, step 3: slipped the whole guard on one character.
+    # The model writes "I’ve" with U+2019, so every contraction in both phrase
+    # lists — "i've", "i'll", "let's", "here's my plan" — could never match.
+    curly = (
+        "I apologize for that error. My previous edit did not correctly address "
+        "the issue. I’ve made a more precise change to `morph/agent.py`. I’ve "
+        "added the `if not prompt.startswith('average'):` check to the `run()` "
+        "method, as I described previously."
+    )
+    assert classify(curly) == "claim", "a typographic apostrophe must not defeat the guard"
+    assert classify(curly.replace("’", "'")) == "claim", "and the plain form still works"
+    assert classify("I’ll edit morph/agent.py to add the missing guard.") == "plan"
+
     # Prose that is neither must never trip it.
     for answer in (
         "Done.",

@@ -409,6 +409,12 @@ CLAIM_PHRASES = (
 )
 
 
+#: Models write prose, and prose uses typographic punctuation. Run #8 slipped
+#: past the whole guard on "I’ve added the check" — U+2019, so none of "i've",
+#: "i'll", "let's" or "here's my plan" could ever match.
+APOSTROPHES = str.maketrans({"’": "'", "‘": "'", "ʼ": "'", "´": "'"})
+
+
 def _describes_work_that_did_not_happen(text: str) -> str | None:
     """``"claim"``, ``"plan"``, or ``None``.
 
@@ -417,7 +423,7 @@ def _describes_work_that_did_not_happen(text: str) -> str | None:
     unexecuted. Claims are checked first: a reply asserting a finished edit is
     worse than one merely proposing it, because the loop records the summary.
     """
-    body = " ".join((text or "").lower().split())
+    body = " ".join((text or "").lower().translate(APOSTROPHES).split())
     if len(body) < 40:  # "Done." and friends are answers, not narration
         return None
     if any(phrase in body for phrase in CLAIM_PHRASES):

@@ -167,6 +167,20 @@ user controls — including a phone.
   scheduled loop on ephemeral runners must commit `selfimprove/history.jsonl`,
   or R-705's "do not repeat a rejected approach" holds only within a single run
   — which is never the interesting case.
+- **R-715** — Every accepted iteration produces a **new version** of the agent,
+  cut before the next iteration begins, so each iteration improves the version
+  that was just released rather than the one before it. The version is a single
+  source of truth (`morph.__version__`), bumped by the loop and not by the
+  model — a change under test has nothing to gain from choosing its own version
+  number. Version tags are created **after** publishing succeeds, never before:
+  a rebase rewrites every SHA, and a tag made earlier would point at an orphan.
+  A tag that already exists is never moved.
+- **R-716** — Every version is downloadable and installable on a phone. The loop
+  builds an Android APK per version and attaches it to a GitHub Release, with
+  the APK's `versionName`/`versionCode` derived from `morph.__version__` so the
+  app and the agent that produced it always carry the same number. The APK is a
+  **client**: it asks for the address of the machine running `morph serve`, and
+  ships no agent, model or conversation data of its own.
 - **R-707** — The loop must never modify `REQUIREMENTS.md`,
   `tests/test_requirements.py`, `bench/scorecard.py`, `bench/tasks/`, or its own
   acceptance criteria. Any iteration that touches them is rejected outright.

@@ -30,6 +30,7 @@ from morph.llm import get_provider
 
 from .guard import violations
 from .prompts import SYSTEM_PROMPT, append_history, build_improvement_prompt, load_history
+from .release import cut_release
 
 log = logging.getLogger("selfimprove")
 
@@ -68,6 +69,8 @@ class Iteration:
     agent_steps: int = 0
     duration_s: float = 0.0
     deltas: dict[str, Any] = field(default_factory=dict)
+    version: str = ""
+    tag: str = ""
 
     def to_entry(self) -> dict[str, Any]:
         return {
@@ -84,6 +87,8 @@ class Iteration:
             "agent_steps": self.agent_steps,
             "duration_s": round(self.duration_s, 1),
             "deltas": self.deltas,
+            "version": self.version,
+            "tag": self.tag,
         }
 
 
@@ -258,6 +263,22 @@ async def run_iteration(
             return iteration
 
         _commit_and_merge(repo, worktree, branch, iteration)
+
+        # Every accepted iteration is a new version of the agent, cut before the
+        # next iteration starts — so the next one improves the version that was
+        # just released, not the one before it (R-715). The bump is made here
+        # rather than by the model: nothing is gained by letting the change under
+        # test also choose its own version number.
+        release = cut_release(
+            summary=iteration.summary,
+            score_before=iteration.score_before,
+            score_after=iteration.score_after,
+            repo=repo,
+        )
+        iteration.version = str(release.version)
+        iteration.tag = release.tag
+        log.info("Cut %s", release.tag)
+
         iteration.accepted = True
         return iteration
 

@@ -4,7 +4,9 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "morph"
-version = "0.1.0"
+# Single source of truth: morph/__init__.py. The self-improvement loop bumps it
+# once per accepted iteration, and the Android build reads the same number.
+dynamic = ["version"]
 description = "Self-hosted coding agent platform that improves itself with Gemma"
 requires-python = ">=3.11"
 dependencies = [
@@ -24,6 +26,9 @@ dev = [
 
 [project.scripts]
 morph = "morph.cli:main"
+
+[tool.setuptools.dynamic]
+version = {attr = "morph.__version__"}
 
 [tool.setuptools.packages.find]
 include = ["morph*", "bench*", "selfimprove*"]

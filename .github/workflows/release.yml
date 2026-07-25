@@ -1,0 +1,200 @@
+name: release
+
+# Builds the Android client and publishes a GitHub Release with the APK
+# attached (R-716).
+#
+# Called by `self-improve.yml` once per version the loop cut during a run, so
+# every evolved version of the agent is downloadable and installable. Also
+# runnable by hand, and on any `v*` tag pushed by a human.
+#
+# The APK is a *client*: Morph is self-hosted, so the app asks for the address
+# of the machine running `morph serve`. Nothing about the agent ships in the
+# APK, which is why it can be built from a tag without a model present.
+
+on:
+  workflow_call:
+    inputs:
+      tag:
+        description: "Tag to build and release"
+        required: true
+        type: string
+    secrets:
+      ANDROID_KEYSTORE_BASE64:
+        required: false
+      ANDROID_KEYSTORE_PASSWORD:
+        required: false
+      ANDROID_KEY_ALIAS:
+        required: false
+      ANDROID_KEY_PASSWORD:
+        required: false
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to build and release (e.g. v0.1.3)"
+        required: true
+        type: string
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  apk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+
+    steps:
+      - name: Resolve the tag
+        id: ref
+        run: |
+          TAG="${{ inputs.tag }}"
+          if [ -z "${TAG}" ]; then TAG="${GITHUB_REF_NAME}"; fi
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.ref.outputs.tag }}
+          fetch-depth: 0
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - uses: android-actions/setup-android@v3
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # The APK version must match the agent version that produced it, so it is
+      # read from the Python package rather than maintained separately.
+      - name: Derive the version
+        id: version
+        run: |
+          python - <<'PY' >> "$GITHUB_OUTPUT"
+          import re, pathlib
+          src = pathlib.Path("morph/__init__.py").read_text()
+          major, minor, patch = map(int, re.search(r'__version__ = "(\d+)\.(\d+)\.(\d+)"', src).groups())
+          print(f"name={major}.{minor}.{patch}")
+          print(f"code={major * 10000 + minor * 100 + patch}")
+          PY
+
+      - name: Configure signing
+        id: signing
+        env:
+          KEYSTORE: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+        run: |
+          # Optional. With no keystore the release APK is signed with the debug
+          # key: it installs fine from a phone browser, it just cannot go to
+          # Play. That keeps the loop able to ship without any secrets set up.
+          if [ -n "${KEYSTORE}" ]; then
+            echo "${KEYSTORE}" | base64 -d > android/keystore.jks
+            cat > android/keystore.properties <<EOF
+          storePassword=${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          keyAlias=${{ secrets.ANDROID_KEY_ALIAS }}
+          keyPassword=${{ secrets.ANDROID_KEY_PASSWORD }}
+          EOF
+            echo "signed=release" >> "$GITHUB_OUTPUT"
+          else
+            echo "No ANDROID_KEYSTORE_BASE64 secret; the APK will carry the debug signature."
+            echo "signed=debug" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build the APK
+        working-directory: android
+        run: |
+          gradle --no-daemon assembleRelease \
+            -PmorphVersionName="${{ steps.version.outputs.name }}" \
+            -PmorphVersionCode="${{ steps.version.outputs.code }}"
+
+      - name: Stage the artefact
+        id: apk
+        run: |
+          SRC=$(find android/app/build/outputs/apk/release -name "*.apk" | head -1)
+          if [ -z "${SRC}" ]; then echo "::error::no APK was produced"; exit 1; fi
+          OUT="morph-${{ steps.ref.outputs.tag }}.apk"
+          cp "${SRC}" "${OUT}"
+          echo "path=${OUT}" >> "$GITHUB_OUTPUT"
+          echo "size=$(du -h "${OUT}" | cut -f1)" >> "$GITHUB_OUTPUT"
+          sha256sum "${OUT}" | tee "${OUT}.sha256"
+
+      - name: Compose the release notes
+        id: notes
+        run: |
+          python - <<'PY'
+          import os, pathlib, re
+
+          tag = "${{ steps.ref.outputs.tag }}"
+          signed = "${{ steps.signing.outputs.signed }}"
+
+          # Pull this version's section out of the changelog the loop wrote.
+          section = ""
+          changelog = pathlib.Path("CHANGELOG.md")
+          if changelog.is_file():
+              blocks = re.split(r"^## ", changelog.read_text(), flags=re.M)
+              for block in blocks:
+                  if block.startswith(tag):
+                      section = "## " + block.strip()
+                      break
+
+          note = (
+              "" if signed == "release" else
+              "\n> This APK carries a **debug signature**. Android will warn about an "
+              "unknown developer; allow installs from your browser to proceed. Add an "
+              "`ANDROID_KEYSTORE_BASE64` secret to get a properly signed build.\n"
+          )
+
+          body = f"""{section or f"## {tag}"}
+
+          ## Install on your phone
+
+          1. Download `morph-{tag}.apk` below.
+          2. Open it. Allow your browser to install unknown apps if prompted.
+          3. Launch Morph and enter the address of the machine running `morph serve`
+             — for example `http://192.168.1.10:8787`, or a forwarded Codespaces URL.
+
+          Morph is self-hosted: the app is a client, and the agent, the model and your
+          conversations stay on hardware you control. Start the server with:
+
+          ```bash
+          morph serve --host 0.0.0.0
+          ```
+          {note}
+          ---
+          *This version was written by Gemma, editing Morph through Morph's own agent.
+          It was released only after the conformance suite passed and the benchmark
+          score held.*
+          """
+          body = "\n".join(line[10:] if line.startswith(" " * 10) else line for line in body.splitlines())
+          pathlib.Path("release-notes.md").write_text(body)
+          PY
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${{ steps.ref.outputs.tag }}"
+          if gh release view "${TAG}" >/dev/null 2>&1; then
+            gh release upload "${TAG}" "${{ steps.apk.outputs.path }}" "${{ steps.apk.outputs.path }}.sha256" --clobber
+          else
+            gh release create "${TAG}" \
+              "${{ steps.apk.outputs.path }}" "${{ steps.apk.outputs.path }}.sha256" \
+              --title "Morph ${TAG}" \
+              --notes-file release-notes.md
+          fi
+
+      - name: Summarise
+        run: |
+          {
+            echo "### Released ${{ steps.ref.outputs.tag }}"
+            echo
+            echo "- APK: \`${{ steps.apk.outputs.path }}\` (${{ steps.apk.outputs.size }})"
+            echo "- Signature: ${{ steps.signing.outputs.signed }}"
+            echo "- versionName ${{ steps.version.outputs.name }} / versionCode ${{ steps.version.outputs.code }}"
+          } >> "$GITHUB_STEP_SUMMARY"

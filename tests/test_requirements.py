@@ -1261,3 +1261,227 @@ def test_R_805_every_requirement_is_covered(repo_root):
 
     uncovered = sorted(declared - referenced)
     assert not uncovered, f"requirements with no test: {uncovered}"
+
+
+# ---------------------------------------------------------------------------
+# Versioning and releases
+# ---------------------------------------------------------------------------
+
+
+def test_R_715_version_has_one_source_of_truth(repo_root):
+    """R-715: the package version, and nothing else, defines the version."""
+    from selfimprove.release import read_version
+
+    import morph
+
+    assert str(read_version(repo_root)) == morph.__version__
+
+    # pyproject must derive it rather than keep a second copy to drift.
+    pyproject = (repo_root / "pyproject.toml").read_text("utf-8")
+    assert 'dynamic = ["version"]' in pyproject
+    assert 'version = {attr = "morph.__version__"}' in pyproject
+    assert not re.search(r'^version = "\d+\.\d+\.\d+"', pyproject, re.M)
+
+
+@pytest.mark.parametrize(
+    ("start", "part", "expected"),
+    [
+        ("0.1.0", "patch", "0.1.1"),
+        ("0.1.99", "patch", "0.2.0"),  # rolls, so version_code stays monotonic
+        ("0.1.5", "minor", "0.2.0"),
+        ("0.1.5", "major", "1.0.0"),
+        ("0.99.99", "patch", "1.0.0"),
+    ],
+)
+def test_R_715_version_bumping(start: str, part: str, expected: str):
+    from selfimprove.release import Version
+
+    assert str(Version.parse(start).bump(part)) == expected
+
+
+def test_R_715_version_code_is_strictly_increasing():
+    """Android refuses to install a versionCode that is not higher than installed."""
+    from selfimprove.release import Version
+
+    version = Version(0, 0, 0)
+    codes = [version.code]
+    for _ in range(250):
+        version = version.bump("patch")
+        codes.append(version.code)
+
+    assert codes == sorted(codes)
+    assert len(set(codes)) == len(codes), "a versionCode was reused"
+
+
+def test_R_715_cut_release_bumps_commits_and_records(tmp_path):
+    from selfimprove.release import cut_release, read_version
+
+    repo = _seed_repo(tmp_path)
+    info = cut_release("Fixed the widget.", 80.0, 85.5, repo=repo)
+
+    assert str(info.version) == "0.1.1"
+    assert info.tag == "v0.1.1"
+    assert str(read_version(repo)) == "0.1.1"
+
+    changelog = (repo / "CHANGELOG.md").read_text("utf-8")
+    assert "## v0.1.1" in changelog
+    assert "- Fixed the widget." in changelog
+    assert "85.5" in changelog and "80.0" in changelog
+
+    # The commit subject is the contract publishing uses to find what to tag.
+    assert _git(repo, "log", "-1", "--format=%s").startswith("release: v0.1.1")
+    # And no tag yet — tags come after a successful push (R-715).
+    assert _git(repo, "tag", "-l") == ""
+
+
+def test_R_715_changelog_accumulates_newest_first(tmp_path):
+    from selfimprove.release import cut_release
+
+    repo = _seed_repo(tmp_path)
+    cut_release("First change.", 80.0, 82.0, repo=repo)
+    cut_release("Second change.", 82.0, 84.0, repo=repo)
+
+    changelog = (repo / "CHANGELOG.md").read_text("utf-8")
+    assert changelog.index("## v0.1.2") < changelog.index("## v0.1.1")
+    assert "First change." in changelog and "Second change." in changelog
+
+
+def test_R_715_release_commits_are_discoverable(tmp_path):
+    from selfimprove.release import cut_release, release_commits
+
+    repo = _seed_repo(tmp_path)
+    base = _git(repo, "rev-parse", "HEAD")
+    cut_release("One.", 1.0, 2.0, repo=repo)
+    _commit(repo, "unrelated.txt", "x", "selfimprove: iteration 2")
+    cut_release("Two.", 2.0, 3.0, repo=repo)
+
+    found = release_commits(repo, f"{base}..HEAD")
+    assert [tag for _sha, tag in found] == ["v0.1.1", "v0.1.2"], "oldest first"
+    for sha, _tag in found:
+        assert len(sha) == 40
+
+
+def test_R_715_tags_are_created_after_publishing(tmp_path):
+    """A tag made before a rebase would point at an orphaned commit."""
+    from selfimprove.publish import publish
+    from selfimprove.release import cut_release
+
+    origin, clone = _two_repos(tmp_path)
+    (clone / "morph").mkdir(parents=True, exist_ok=True)
+    (clone / "morph" / "__init__.py").write_text('__version__ = "0.1.0"\n')
+    _git(clone, "add", "-A")
+    _git(clone, "commit", "-qm", "seed version")
+    _git(clone, "push", "-q", "origin", "HEAD:main")
+
+    cut_release("An improvement.", 80.0, 84.0, repo=clone)
+    # main moves while the run is in flight, forcing a rebase.
+    _commit(origin, "human.txt", "theirs", "human: unrelated")
+
+    result = publish(repo=clone, branch="main", remote="origin", verify=None)
+
+    assert result.published, result.reason
+    assert result.rebased
+    assert result.tags == ["v0.1.1"]
+
+    # The tag must point at a commit that is actually on main, post-rebase.
+    tagged = _git(origin, "rev-list", "-n", "1", "v0.1.1")
+    assert tagged in _git(origin, "rev-list", "main").splitlines()
+
+
+def test_R_715_existing_tags_are_never_moved(tmp_path):
+    """A shipped version keeps pointing at the code that shipped."""
+    from selfimprove.publish import tag_releases
+    from selfimprove.release import cut_release
+
+    repo = _seed_repo(tmp_path)
+    base = _git(repo, "rev-parse", "HEAD")
+    cut_release("One.", 1.0, 2.0, repo=repo)
+    _git(repo, "tag", "-a", "v0.1.1", base, "-m", "pre-existing, elsewhere")
+    pinned = _git(repo, "rev-list", "-n", "1", "v0.1.1")
+
+    created = tag_releases(repo, f"{base}..HEAD", remote="origin")
+
+    assert created == [], "an existing tag must not be recreated"
+    assert _git(repo, "rev-list", "-n", "1", "v0.1.1") == pinned
+
+
+def test_R_716_android_client_exists_and_derives_its_version(repo_root):
+    """R-716: a real Android project, versioned from the Python package."""
+    android = repo_root / "android"
+    for required in (
+        "settings.gradle.kts",
+        "build.gradle.kts",
+        "app/build.gradle.kts",
+        "app/src/main/AndroidManifest.xml",
+        "app/src/main/java/dev/morph/app/MainActivity.kt",
+        "app/src/main/res/layout/activity_main.xml",
+    ):
+        assert (android / required).is_file(), f"missing {required}"
+
+    gradle = (android / "app" / "build.gradle.kts").read_text("utf-8")
+    assert "morphVersionName" in gradle and "morphVersionCode" in gradle
+    assert "versionCode = morphVersionCode" in gradle
+    assert "versionName = morphVersionName" in gradle
+
+    manifest = (android / "app" / "src" / "main" / "AndroidManifest.xml").read_text("utf-8")
+    assert "android.permission.INTERNET" in manifest
+
+    # Launcher icons at every density Android asks for.
+    for density in ("mdpi", "hdpi", "xhdpi", "xxhdpi", "xxxhdpi"):
+        icon = android / "app" / "src" / "main" / "res" / f"mipmap-{density}" / "ic_launcher.png"
+        assert icon.is_file(), f"missing {density} launcher icon"
+        assert icon.read_bytes()[:8] == b"\x89PNG\r\n\x1a\n"
+
+
+def test_R_716_client_ships_no_agent_and_asks_for_a_server(repo_root):
+    """The APK is a window onto self-hosted Morph, not a copy of it."""
+    activity = (
+        repo_root / "android" / "app" / "src" / "main" / "java" / "dev" / "morph" / "app" / "MainActivity.kt"
+    ).read_text("utf-8")
+
+    assert "KEY_SERVER" in activity, "the app must ask for the server address"
+    assert "SharedPreferences" in activity or "getSharedPreferences" in activity
+    assert "javaScriptEnabled = true" in activity
+    assert "domStorageEnabled = true" in activity, "the web client stores its session id"
+    # No API keys or model endpoints baked into a shipped binary.
+    for leak in ("GOOGLE_API_KEY", "FLUX_API_KEY", "api_key", "generativelanguage"):
+        assert leak not in activity
+
+
+def test_R_716_release_workflow_builds_and_publishes_the_apk(repo_root):
+    workflow = repo_root / ".github" / "workflows" / "release.yml"
+    assert workflow.is_file()
+    body = workflow.read_text("utf-8")
+
+    assert "workflow_call" in body, "self-improve must be able to call it per version"
+    assert "setup-android" in body
+    assert "assembleRelease" in body
+    assert "gh release create" in body
+    assert ".apk" in body
+    assert "contents: write" in body
+    # Version flows from the Python package into the APK.
+    assert "morph/__init__.py" in body
+    assert "morphVersionName" in body and "morphVersionCode" in body
+
+
+def test_R_716_self_improve_releases_every_version_it_cuts(repo_root):
+    body = (repo_root / ".github" / "workflows" / "self-improve.yml").read_text("utf-8")
+
+    assert "release.yml" in body
+    assert "needs: evolve" in body
+    # One release per tag, driven by what publishing actually created.
+    assert "fromJSON(needs.evolve.outputs.tags)" in body
+    assert "tags: ${{ steps.publish.outputs.tags }}" in body
+
+
+def _seed_repo(tmp_path: Path) -> Path:
+    """A git repo with a morph package at 0.1.0."""
+    repo = tmp_path / f"seed-{len(list(tmp_path.iterdir()))}"
+    (repo / "morph").mkdir(parents=True)
+    (repo / "morph" / "__init__.py").write_text('__version__ = "0.1.0"\n')
+    _git(repo, "init", "-q")
+    _git(repo, "config", "user.email", "t@example.com")
+    _git(repo, "config", "user.name", "t")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "base")
+    return repo

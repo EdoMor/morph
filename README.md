@@ -30,7 +30,7 @@ loop cannot edit it.
 | **Skills** | Claude-compatible `SKILL.md` directories, lazily loaded |
 | **MCP** | Full client — stdio and HTTP servers, namespaced tools, failure isolation |
 | **Images** | Pluggable image flow: FLUX, Gemini, local Diffusers/ComfyUI, or offline stub |
-| **Client** | Installable mobile PWA served from the same process |
+| **Client** | Installable mobile PWA, plus an Android APK released per version |
 | **Deps** | `httpx` and `pyyaml`. No web framework, no ML stack — it runs on a phone |
 
 ## Quick start
@@ -92,7 +92,15 @@ Each iteration:
    - score went down → rejected;
    - a protected file was touched → rejected outright;
    - otherwise → committed and fast-forwarded onto the working branch.
-5. **Appends** the outcome to `selfimprove/history.jsonl`.
+5. **Cuts a version** — every accepted iteration bumps `morph.__version__`,
+   writes a changelog entry, and becomes a `release: vX.Y.Z` commit. The next
+   iteration therefore improves the version that was just released, not the one
+   before it. The bump is made by the loop, not the model: a change under test
+   has nothing to gain from choosing its own version number.
+6. **Appends** the outcome to `selfimprove/history.jsonl`.
+
+Then, once per run: publish to `main`, tag each version, and **build an APK per
+version and attach it to a GitHub Release**.
 
 ### Scoring
 
@@ -225,6 +233,36 @@ Three operational notes:
   ephemeral, so without this the loop would forget every previous attempt at the
   end of each run and re-try the same dead ends nightly.
 
+## Getting it on your phone
+
+Every version the loop produces is published as a GitHub Release with an APK
+attached. Open **Releases**, download `morph-vX.Y.Z.apk`, and install it — you
+will need to let your browser install unknown apps.
+
+The APK is a **client**. Morph is self-hosted, so on first launch it asks for the
+address of the machine running the agent:
+
+```bash
+morph serve --host 0.0.0.0     # then enter e.g. http://192.168.1.10:8787
+```
+
+The agent, the model and your conversations stay on hardware you control;
+nothing about them ships inside the APK. A forwarded Codespaces URL works too,
+and so does Termux on the phone itself (option B above) — in which case point it
+at `http://127.0.0.1:8787`.
+
+Without an `ANDROID_KEYSTORE_BASE64` repository secret the APK is **debug
+signed**: it installs from a browser fine, but Android will warn about an
+unknown developer and it cannot go through Play. Add the secret (plus
+`ANDROID_KEYSTORE_PASSWORD`, `ANDROID_KEY_ALIAS`, `ANDROID_KEY_PASSWORD`) to get
+properly signed builds.
+
+Versioning is single-source: `morph.__version__` drives the Python package, the
+git tag, the release, and the APK's `versionName`/`versionCode` — so the app and
+the agent that produced it always carry the same number. Tags are created
+**after** the push succeeds, never before: a rebase rewrites every SHA, and a tag
+made earlier would point at an orphaned commit.
+
 ## Configuration
 
 `morph.json` in the workspace root, overridden by environment variables:
@@ -282,7 +320,8 @@ lines of context, not a hundred documents.
 morph/          agent core, tools, skills, MCP, API, server, CLI
 webapp/         mobile PWA (no build step)
 bench/          scorecard, plus coding / tool_use / mcp / skills / robustness suites
-selfimprove/    the loop, its prompts, the guard rails, and publishing
+selfimprove/    the loop, its prompts, the guard rails, versioning, publishing
+android/        the phone client (WebView shell, built into an APK per version)
 tests/          the conformance suite — one test per requirement ID
 ```
 

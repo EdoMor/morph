@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="morph_bg">#0B0D10</color>
+    <color name="morph_text">#E7ECF2</color>
+    <color name="morph_accent">#6EE7B7</color>
+</resources>

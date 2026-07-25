@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Morph</string>
+    <string name="server_title">Connect to your Morph server</string>
+    <string name="server_message">Morph runs on your own hardware. Enter the address of the machine running `morph serve` — for example http://192.168.1.10:8787, or a forwarded Codespaces URL.</string>
+    <string name="connect">Connect</string>
+    <string name="retry">Retry</string>
+    <string name="change_server">Change server</string>
+    <string name="cannot_connect">Cannot reach the Morph server.</string>
+</resources>

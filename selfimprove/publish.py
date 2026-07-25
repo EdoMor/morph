@@ -49,6 +49,7 @@ class PublishResult:
     attempts: int = 0
     rebased: bool = False
     head: str = ""
+    tags: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -58,6 +59,7 @@ class PublishResult:
             "attempts": self.attempts,
             "rebased": self.rebased,
             "head": self.head,
+            "tags": self.tags,
         }
 
 
@@ -88,6 +90,34 @@ def pytest_verifier(repo: Path) -> tuple[bool, str]:
     )
     tail = (result.stdout + result.stderr).strip().splitlines()[-15:]
     return result.returncode == 0, "\n".join(tail)
+
+
+def tag_releases(repo: Path, rev_range: str, remote: str = "origin") -> list[str]:
+    """Tag every release commit in ``rev_range`` and push the tags.
+
+    Called only after the branch push succeeded, so the SHAs are final. Existing
+    tags are left alone rather than moved — a version that has already shipped
+    must keep pointing at the code that shipped.
+    """
+    from .release import release_commits
+
+    created: list[str] = []
+    for sha, tag in release_commits(repo, rev_range):
+        existing = git(repo, "rev-parse", "-q", "--verify", f"refs/tags/{tag}", check=False)
+        if existing:
+            if existing != sha:
+                log.warning("tag %s already exists at %s; not moving it", tag, existing[:8])
+            continue
+        ok, detail = _try_git(repo, "tag", "-a", tag, sha, "-m", f"Morph {tag}")
+        if not ok:
+            log.warning("could not create tag %s: %s", tag, detail[:200])
+            continue
+        pushed, detail = _try_git(repo, "push", remote, f"refs/tags/{tag}")
+        if pushed:
+            created.append(tag)
+        else:
+            log.warning("could not push tag %s: %s", tag, detail[:200])
+    return created
 
 
 def commits_ahead(repo: Path, upstream: str) -> list[str]:
@@ -170,10 +200,16 @@ def publish(
 
         # Never --force. A loop that can overwrite history is one bad iteration
         # away from deleting the project.
+        merge_base = git(repo, "merge-base", "HEAD", upstream, check=False)
         pushed, detail = _try_git(repo, "push", remote, f"HEAD:refs/heads/{branch}")
         if pushed:
             result.published = True
             result.reason = f"pushed {len(ahead)} commit(s) to {upstream}"
+            # Tags are created only now. A rebase rewrites every SHA, so a tag
+            # made before the push would point at an orphaned commit that is on
+            # no branch — and the release built from it would not be the code
+            # anyone is running.
+            result.tags = tag_releases(repo, f"{merge_base}..HEAD", remote=remote)
             return result
 
         log.warning("push rejected (attempt %d/%d): %s", attempt, attempts, detail[:200])

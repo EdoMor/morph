@@ -63,6 +63,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 330
 
+    outputs:
+      tags: ${{ steps.publish.outputs.tags }}
+
     env:
       MORPH_PROVIDER: ${{ inputs.provider || 'ollama' }}
       MORPH_MODEL: ${{ inputs.model || 'gemma3:4b' }}
@@ -158,8 +161,19 @@ jobs:
       # Gate 3+4. Rebase onto whatever main is now, re-run the suite, push
       # without force, retry the race.
       - name: Publish to ${{ inputs.publish_branch || 'main' }}
+        id: publish
         if: steps.changed.outputs.count != '0' && inputs.dry_run != true
-        run: python -m selfimprove.publish --branch "${PUBLISH_BRANCH}" --attempts 5
+        run: |
+          python -m selfimprove.publish --branch "${PUBLISH_BRANCH}" --attempts 5 \
+            | tee publish-result.json
+          # Tags are created by publishing, after any rebase settled the SHAs.
+          python - <<'PY' >> "$GITHUB_OUTPUT"
+          import json, pathlib
+          data = json.loads(pathlib.Path("publish-result.json").read_text())
+          tags = data.get("tags") or []
+          print(f"tags={json.dumps(tags)}")
+          print(f"any={'true' if tags else 'false'}")
+          PY
 
       - name: Publish (dry run)
         if: steps.changed.outputs.count != '0' && inputs.dry_run == true
@@ -187,5 +201,23 @@ jobs:
             baseline.txt
             final.txt
             loop-output.json
+            publish-result.json
             selfimprove/history.jsonl
           if-no-files-found: warn
+
+  # One downloadable, installable release per version the loop cut this run.
+  # A reusable workflow rather than a tag trigger: pushes made with GITHUB_TOKEN
+  # do not start new workflow runs, so a `push: tags:` trigger would never fire
+  # for the bot's own tags.
+  release:
+    needs: evolve
+    if: needs.evolve.outputs.tags != '' && needs.evolve.outputs.tags != '[]'
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        tag: ${{ fromJSON(needs.evolve.outputs.tags) }}
+    uses: ./.github/workflows/release.yml
+    with:
+      tag: ${{ matrix.tag }}
+    secrets: inherit

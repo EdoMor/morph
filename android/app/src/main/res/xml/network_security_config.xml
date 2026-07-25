@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Morph servers usually live on a LAN address over plain HTTP: a laptop, a Pi,
+  or Termux on this phone. Cleartext is permitted so that works out of the box.
+  Traffic never leaves the user's own network unless they point the app at a
+  public HTTPS URL, which is also supported.
+-->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="true">
+        <trust-anchors>
+            <certificates src="system" />
+            <certificates src="user" />
+        </trust-anchors>
+    </base-config>
+</network-security-config>

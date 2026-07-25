@@ -1,0 +1,71 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0b0d10">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Morph">
+<title>Morph</title>
+<link rel="manifest" href="/manifest.webmanifest">
+<link rel="icon" href="/icon.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="/icon-192.png">
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<header class="bar">
+  <button id="menu-btn" class="icon-btn" aria-label="Menu" aria-expanded="false">
+    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M4 12h16M4 17h16"/></svg>
+  </button>
+  <div class="title">
+    <strong>Morph</strong>
+    <span id="status" class="status" aria-live="polite">connecting…</span>
+  </div>
+  <button id="new-btn" class="icon-btn" aria-label="New conversation">
+    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>
+  </button>
+</header>
+
+<div id="scrim" class="scrim" hidden></div>
+
+<nav id="drawer" class="drawer" aria-label="Sessions and capabilities">
+  <section>
+    <h2>Sessions</h2>
+    <ul id="session-list" class="list"><li class="muted">No sessions yet</li></ul>
+  </section>
+  <section>
+    <h2>Tools <span id="tool-count" class="pill">0</span></h2>
+    <ul id="tool-list" class="list"></ul>
+  </section>
+  <section>
+    <h2>Skills <span id="skill-count" class="pill">0</span></h2>
+    <ul id="skill-list" class="list"><li class="muted">None installed</li></ul>
+  </section>
+</nav>
+
+<main id="log" class="log" aria-live="polite">
+  <div class="empty">
+    <h1>What are we building?</h1>
+    <p>Morph runs on your hardware. Ask it to read code, run commands, search the
+       web, or generate an image.</p>
+    <div class="chips">
+      <button class="chip" data-prompt="Summarise the structure of this repository.">Explore the repo</button>
+      <button class="chip" data-prompt="Run the test suite and tell me what fails.">Run the tests</button>
+      <button class="chip" data-prompt="Generate an image of a lighthouse in a storm, painterly, 512x512.">Generate an image</button>
+    </div>
+  </div>
+</main>
+
+<form id="composer" class="composer">
+  <textarea id="input" rows="1" placeholder="Ask Morph…" autocomplete="off"
+            enterkeyhint="send" aria-label="Message"></textarea>
+  <button id="send" type="submit" class="send" aria-label="Send">
+    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 12l16-8-6 8 6 8z"/></svg>
+  </button>
+</form>
+
+<script src="/app.js" type="module"></script>
+</body>
+</html>

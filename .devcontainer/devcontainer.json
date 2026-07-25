@@ -1,0 +1,43 @@
+{
+  "name": "Morph — Gemma self-improvement",
+  "image": "mcr.microsoft.com/devcontainers/python:3.11-bookworm",
+  "features": {
+    "ghcr.io/devcontainers/features/github-cli:1": {},
+    "ghcr.io/devcontainers/features/node:1": { "version": "20" }
+  },
+  "hostRequirements": {
+    "cpus": 4,
+    "memory": "16gb",
+    "storage": "32gb"
+  },
+  "postCreateCommand": "bash .devcontainer/setup.sh",
+  "postStartCommand": "nohup ollama serve > /tmp/ollama.log 2>&1 &",
+  "forwardPorts": [8787, 11434],
+  "portsAttributes": {
+    "8787": {
+      "label": "Morph web app",
+      "onAutoForward": "notify",
+      "visibility": "private"
+    },
+    "11434": {
+      "label": "Ollama (Gemma)",
+      "onAutoForward": "silent"
+    }
+  },
+  "remoteEnv": {
+    "MORPH_PROVIDER": "ollama",
+    "MORPH_MODEL": "${localEnv:MORPH_MODEL:gemma3:4b}",
+    "MORPH_IMAGE_BACKEND": "${localEnv:MORPH_IMAGE_BACKEND:stub}",
+    "MORPH_HOST": "0.0.0.0",
+    "PYTHONUNBUFFERED": "1"
+  },
+  "customizations": {
+    "vscode": {
+      "extensions": ["ms-python.python", "charliermarsh.ruff"],
+      "settings": {
+        "python.testing.pytestEnabled": true,
+        "python.testing.pytestArgs": ["tests"]
+      }
+    }
+  }
+}

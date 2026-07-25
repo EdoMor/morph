@@ -1,0 +1,38 @@
+{
+  "_comment": "Copy to morph.json and edit. Environment variables override everything here. Never put credentials in this file (R-803).",
+
+  "provider": "ollama",
+  "model": "gemma3:12b",
+  "base_url": "http://127.0.0.1:11434",
+  "max_steps": 24,
+  "temperature": 0.2,
+
+  "image_backend": "stub",
+  "image_output_dir": ".morph/images",
+
+  "skill_paths": ["skills", ".morph/skills"],
+
+  "host": "127.0.0.1",
+  "port": 8787,
+  "allow_shell": true,
+
+  "mcp_servers": {
+    "filesystem": {
+      "transport": "stdio",
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "."]
+    },
+    "git": {
+      "transport": "stdio",
+      "command": "uvx",
+      "args": ["mcp-server-git", "--repository", "."],
+      "enabled": false
+    },
+    "remote": {
+      "transport": "http",
+      "url": "https://example.com/mcp",
+      "timeout": 30.0,
+      "enabled": false
+    }
+  }
+}

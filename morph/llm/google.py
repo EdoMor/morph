@@ -18,7 +18,7 @@ from .base import (
     ModelResponse,
     ProviderError,
     ToolCall,
-    parse_text_tool_calls,
+    parse_tool_calls,
     render_tools_for_text_protocol,
 )
 
@@ -178,13 +178,16 @@ class GoogleProvider:
                 calls.append(ToolCall(name=fc.get("name", ""), arguments=fc.get("args") or {}))
 
         text = "".join(text_bits)
+        errors: list[str] = []
         if not calls:  # text-protocol fallback
-            text, calls = parse_text_tool_calls(text)
+            parsed = parse_tool_calls(text)
+            text, calls, errors = parsed.text, parsed.calls, parsed.errors
 
         usage = data.get("usageMetadata") or {}
         return ModelResponse(
             text=text.strip(),
             tool_calls=calls,
+            malformed_calls=errors,
             stop_reason="tool_use" if calls else "end_turn",
             usage={
                 "input_tokens": usage.get("promptTokenCount", 0),

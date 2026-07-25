@@ -50,7 +50,15 @@ user controls — including a phone.
   writes Morph's code; Morph must be able to run on it.
 - **R-105** — Providers that lack native function-calling must still support
   tools, via a documented text protocol the agent parses. Gemma models exposed
-  through Ollama fall in this category.
+  through Ollama fall in this category. Because the protocol is JSON emitted by
+  a language model, it must be **forgiving of the mistakes models actually
+  make** and must never fail silently:
+  - a stray backslash — what a model produces every time it writes a regex — is
+    repaired rather than rejected, without corrupting escapes that were correct;
+  - a block that still cannot be parsed is reported back to the model as a
+    failed tool result so it can retry, never dropped and treated as prose.
+    Dropping it ends the run at that step having done nothing, with the model
+    never learning why.
 - **R-106** — Conversations are persisted as append-only JSONL sessions and can
   be resumed by id, with no loss of tool calls or results.
 - **R-107** — A run emits a structured event stream (`text`, `tool_use`,

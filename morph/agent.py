@@ -209,6 +209,28 @@ class Agent:
                 yield AgentEvent("text", {"text": response.text, "step": steps})
 
             if not response.tool_calls:
+                # A tool_call block the parser could not read is not an answer.
+                # Silently treating it as prose ends the run at this step with
+                # no changes made and no explanation to the model — the single
+                # most common way a small model's iteration used to die.
+                if response.malformed_calls and steps < budget:
+                    active.assistant(response.text)
+                    active.tool(
+                        "tool_call_parser",
+                        _malformed_call_guidance(response.malformed_calls),
+                        ok=False,
+                    )
+                    yield AgentEvent(
+                        "error",
+                        {
+                            "message": "tool call could not be parsed; asking the model to retry",
+                            "details": response.malformed_calls,
+                            "recoverable": True,
+                            "step": steps,
+                        },
+                    )
+                    continue
+
                 active.assistant(response.text)
                 stop_reason = response.stop_reason or "end_turn"
                 break
@@ -264,6 +286,20 @@ class Agent:
     async def _invoke(self, call: ToolCall) -> ToolResult:
         """Execute one tool call. Failures become results, not exceptions (R-109)."""
         return await self.tools.call(call.name, call.arguments)
+
+
+def _malformed_call_guidance(errors: list[str]) -> str:
+    """What the model is told when its tool_call block would not parse."""
+    listed = "\n".join(f"- {error}" for error in errors)
+    return (
+        "Your tool_call block was not valid JSON, so no tool ran:\n"
+        f"{listed}\n\n"
+        "Send it again as exactly one JSON object per ```tool_call``` block. "
+        "Remember that backslashes must be doubled inside JSON strings: a regex "
+        'for `average(` is written "average\\\\(" and one for a digit is "\\\\d". '
+        "If you meant to answer rather than call a tool, reply in plain prose "
+        "with no tool_call block."
+    )
 
 
 async def run_once(prompt: str, config: Config | None = None, **kwargs: Any) -> RunResult:

@@ -29,6 +29,9 @@ class ModelResponse:
     stop_reason: str = "end_turn"
     usage: dict[str, int] = field(default_factory=dict)
     raw: Any = None
+    #: Tool-call blocks that could not be parsed. Never silently discarded —
+    #: the agent hands these back to the model so it can correct itself.
+    malformed_calls: list[str] = field(default_factory=list)
 
 
 class ProviderError(RuntimeError):
@@ -74,20 +77,65 @@ tagged `tool_call` containing a single JSON object with `name` and `arguments`:
 Rules:
 - One JSON object per block. Emit several blocks to call several tools.
 - `arguments` must match the tool's schema exactly. No comments, no trailing commas.
+- **Backslashes must be doubled**, because this is JSON. A regex for `average(`
+  is written `"average\\\\("`, not `"average\\("`. Getting this wrong is the most
+  common way a tool call fails.
 - Stop after emitting your tool calls; the results come back in the next turn.
 - When you are done and need no more tools, reply with plain prose and no
   `tool_call` block.
 """
 
 
-def parse_text_tool_calls(text: str) -> tuple[str, list[ToolCall]]:
-    """Split model output into prose and tool calls.
+# JSON accepts a backslash only before one of `"\/bfnrtu`. A model writing a
+# regex emits `\)` or `\d` constantly — invalid JSON, but unambiguously meant as
+# a literal backslash.
+#
+# The alternation matters: valid escapes are consumed as a unit so that the pair
+# `\\` is recognised as one escaped backslash. Scanning character by character
+# instead would see the second backslash of `\\(` as a stray one and "repair" a
+# string that was already correct.
+ESCAPE_RE = re.compile(r'\\(?:(["\\/bfnrtu]|u[0-9a-fA-F]{4})|(.))', re.DOTALL)
 
-    Returns ``(prose, calls)``. Malformed JSON inside a block is left in the
-    prose rather than raising, so a sloppy model degrades to a normal answer
-    instead of crashing the run (R-109).
+
+def repair_json(body: str) -> str:
+    """Double the stray backslashes that make a model's regex invalid JSON."""
+
+    def fix(match: re.Match[str]) -> str:
+        if match.group(1) is not None:
+            return match.group(0)  # already a valid escape
+        return "\\\\" + match.group(2)
+
+    return ESCAPE_RE.sub(fix, body)
+
+
+def _load_tool_payload(body: str) -> tuple[dict[str, Any] | None, str | None]:
+    """Parse a tool-call body, repairing invalid escapes before giving up."""
+    try:
+        return json.loads(body), None
+    except json.JSONDecodeError as first:
+        try:
+            return json.loads(repair_json(body)), None
+        except json.JSONDecodeError:
+            return None, f"{first.msg} at position {first.pos}"
+
+
+@dataclass
+class ParsedToolCalls:
+    text: str
+    calls: list[ToolCall] = field(default_factory=list)
+    errors: list[str] = field(default_factory=list)
+
+
+def parse_tool_calls(text: str) -> ParsedToolCalls:
+    """Split model output into prose, tool calls, and parse failures.
+
+    A block that cannot be parsed is reported rather than dropped. Silently
+    treating it as prose ends the run at that step with no explanation to the
+    model and no changes made — which is precisely what a small model emitting
+    an unescaped regex used to trigger.
     """
     calls: list[ToolCall] = []
+    errors: list[str] = []
     leftovers: list[str] = []
     cursor = 0
 
@@ -95,21 +143,30 @@ def parse_text_tool_calls(text: str) -> tuple[str, list[ToolCall]]:
         leftovers.append(text[cursor : match.start()])
         cursor = match.end()
         body = match.group("body").strip()
-        try:
-            payload = json.loads(body)
-        except json.JSONDecodeError:
-            leftovers.append(match.group(0))
+
+        payload, error = _load_tool_payload(body)
+        if payload is None:
+            errors.append(f"{error}. Block was: {body[:300]}")
             continue
         if not isinstance(payload, dict) or "name" not in payload:
-            leftovers.append(match.group(0))
+            errors.append(
+                f"a tool_call block must be a JSON object with a \"name\". Block was: {body[:300]}"
+            )
             continue
+
         args = payload.get("arguments") or payload.get("args") or {}
         if not isinstance(args, dict):
             args = {"value": args}
         calls.append(ToolCall(name=str(payload["name"]), arguments=args))
 
     leftovers.append(text[cursor:])
-    return "".join(leftovers).strip(), calls
+    return ParsedToolCalls(text="".join(leftovers).strip(), calls=calls, errors=errors)
+
+
+def parse_text_tool_calls(text: str) -> tuple[str, list[ToolCall]]:
+    """Backwards-compatible view of :func:`parse_tool_calls`."""
+    parsed = parse_tool_calls(text)
+    return parsed.text, parsed.calls
 
 
 def render_tools_for_text_protocol(tools: list[dict[str, Any]]) -> str:

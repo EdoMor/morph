@@ -97,10 +97,89 @@ def test_R_105_text_tool_protocol():
 
     assert get_provider("ollama").supports_native_tools is False
 
-    # Malformed blocks degrade to prose rather than raising.
+    # Malformed blocks never raise.
     prose, none = parse_text_tool_calls("```tool_call\n{not json}\n```")
     assert none == []
-    assert "not json" in prose
+
+
+def test_R_105_stray_backslashes_are_repaired():
+    """The exact failure gemma3:4b hit: a regex makes the JSON invalid.
+
+    Both blocks below are verbatim from a real run in which every iteration
+    died at step 1 because the tool call could not be parsed.
+    """
+    from morph.llm.base import parse_tool_calls, repair_json
+
+    for body in (
+        r'{"name": "grep", "arguments": {"pattern": "average\\\\(.*\\)", "path": "a.py"}}',
+        r'{"name": "grep", "arguments": {"pattern": "\\d+\\s*", "path": "a.py"}}',
+    ):
+        parsed = parse_tool_calls(f"```tool_call\n{body}\n```")
+        assert parsed.calls, f"still unparseable: {parsed.errors}"
+        assert parsed.calls[0].name == "grep"
+        assert not parsed.errors
+
+    # A repaired pattern must still be the regex the model meant.
+    parsed = parse_tool_calls(
+        '```tool_call\n{"name": "grep", "arguments": {"pattern": "def foo\\("}}\n```'
+    )
+    assert parsed.calls[0].arguments["pattern"] == r"def foo\("
+
+    # Repair must not touch escapes that were already valid.
+    intact = r'{"a": "line\nbreak", "b": "say \"hi\"", "c": "back\\\\slash"}'
+    assert repair_json(intact) == intact
+
+
+def test_R_105_unparseable_calls_are_reported_not_dropped():
+    from morph.llm.base import parse_tool_calls
+
+    parsed = parse_tool_calls('```tool_call\n{"name": "grep", "arguments": {oops}}\n```')
+    assert parsed.calls == []
+    assert parsed.errors, "an unreadable block must be reported"
+    assert "oops" in parsed.errors[0]
+
+    # A block that is valid JSON but not a tool call is also reported.
+    parsed = parse_tool_calls('```tool_call\n["not", "an", "object"]\n```')
+    assert parsed.calls == []
+    assert parsed.errors
+
+
+async def test_R_105_agent_asks_the_model_to_retry_a_bad_tool_call(config, registry):
+    """A parse failure must not silently end the run having changed nothing."""
+    from morph.llm.base import ModelResponse
+
+    class Fumbling:
+        """Emits an unparseable call once, then recovers."""
+
+        name = "fumbling"
+        supports_native_tools = False
+
+        def __init__(self) -> None:
+            self.seen: list[list[dict]] = []
+
+        async def complete(self, messages, tools=None, **kwargs):  # noqa: ANN001, ANN003
+            self.seen.append(list(messages))
+            if len(self.seen) == 1:
+                return ModelResponse(
+                    text="Let me search.",
+                    malformed_calls=["Invalid \\escape at position 55"],
+                )
+            return ModelResponse(
+                text="",
+                tool_calls=[EchoProvider.call("write_file", path="ok.txt", content="x").tool_calls[0]],
+            )
+
+    provider = Fumbling()
+    agent = Agent(config=config, provider=provider, tools=registry, skills=SkillRegistry())
+    result = await agent.run("Find something.", max_steps=5)
+
+    assert result.steps >= 2, "the run ended instead of asking the model to retry"
+    assert (config.root / "ok.txt").is_file(), "the recovered call never ran"
+
+    # The model must actually have been told what was wrong.
+    retry_context = json.dumps(provider.seen[1])
+    assert "not valid JSON" in retry_context
+    assert "backslashes must be doubled" in retry_context.lower()
 
 
 async def test_R_106_sessions_persist_and_resume(make_agent, call, say):

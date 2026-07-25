@@ -17,7 +17,7 @@ from .base import (
     ModelResponse,
     ProviderError,
     messages_to_prompt,
-    parse_text_tool_calls,
+    parse_tool_calls,
     render_tools_for_text_protocol,
 )
 
@@ -79,11 +79,12 @@ class OllamaProvider:
             raise ProviderError(f"Ollama request failed: {exc}") from exc
 
         raw_text = (data.get("message") or {}).get("content", "")
-        prose, calls = parse_text_tool_calls(raw_text)
+        parsed = parse_tool_calls(raw_text)
         return ModelResponse(
-            text=prose,
-            tool_calls=calls,
-            stop_reason="tool_use" if calls else "end_turn",
+            text=parsed.text,
+            tool_calls=parsed.calls,
+            malformed_calls=parsed.errors,
+            stop_reason="tool_use" if parsed.calls else "end_turn",
             usage={
                 "input_tokens": data.get("prompt_eval_count", 0),
                 "output_tokens": data.get("eval_count", 0),

@@ -1751,3 +1751,143 @@ def test_R_717_pages_workflow_deploys_and_is_callable(repo_root):
     improve = (repo_root / ".github" / "workflows" / "self-improve.yml").read_text("utf-8")
     assert "pages.yml" in improve
     assert "selfimprove/scorecard.json" in improve
+
+
+# ---------------------------------------------------------------------------
+# Watching a run while it happens
+# ---------------------------------------------------------------------------
+
+
+def test_R_718_trace_renders_every_event_kind():
+    """R-718: each step must be legible as it happens, not just in aggregate."""
+    import io
+
+    from morph.agent import AgentEvent
+    from morph.trace import TraceRenderer
+
+    buffer = io.StringIO()
+    tracer = TraceRenderer(stream=buffer)
+
+    tracer.event(AgentEvent("tool_use", {"step": 3, "name": "grep",
+                                         "arguments": {"pattern": "def average", "path": "."}}))
+    tracer.event(AgentEvent("tool_result", {"ok": True, "duration_ms": 1200,
+                                            "content": "calc.py:1: def average(values):"}))
+    tracer.event(AgentEvent("tool_result", {"ok": False, "duration_ms": 300,
+                                            "content": "old_string not found in calc.py"}))
+    tracer.event(AgentEvent("error", {"message": "tool call could not be parsed",
+                                      "recoverable": True}))
+    tracer.event(AgentEvent("done", {"result": {"stop_reason": "end_turn", "steps": 6,
+                                                "tool_calls": [{}, {}]}}))
+    output = buffer.getvalue()
+
+    assert "step  3" in output and "grep(" in output
+    assert "def average" in output, "the arguments must be visible, not just the tool name"
+    assert "ok" in output and "FAIL" in output, "success and failure must be distinguishable"
+    assert "not found" in output, "the failure reason must be shown"
+    assert "retrying" in output, "a recoverable error must say so"
+    assert "end_turn after 6 step" in output
+
+
+def test_R_718_trace_bounds_long_output():
+    """A trace is for scanning; one tool result must not flood the log."""
+    import io
+
+    from morph.agent import AgentEvent
+    from morph.trace import TraceRenderer
+
+    buffer = io.StringIO()
+    TraceRenderer(stream=buffer).event(
+        AgentEvent("tool_result", {"ok": True, "duration_ms": 1, "content": "x" * 50_000})
+    )
+    output = buffer.getvalue()
+
+    assert len(output) < 1000, "a single event must not dump 50KB into the log"
+    assert output.count("\n") == 1, "one event, one line"
+    assert "…" in output, "truncation must be visible"
+
+
+def test_R_718_trace_writes_to_stderr_not_stdout():
+    """stdout carries JSON that CI pipes into a file; a trace line would corrupt it."""
+    import sys
+
+    from morph.trace import TraceRenderer
+
+    assert TraceRenderer().stream is sys.stderr
+
+    # And the two commands that emit JSON on stdout must not trace onto it.
+    loop_source = (REPO_ROOT / "selfimprove" / "loop.py").read_text("utf-8")
+    assert "| tee loop-output.json" not in loop_source  # sanity: that lives in CI
+    workflow = (REPO_ROOT / ".github" / "workflows" / "self-improve.yml").read_text("utf-8")
+    assert "tee loop-output.json" in workflow, "CI captures stdout, so stdout must stay clean"
+
+
+def test_R_718_progress_heartbeat_tracks_activity(tmp_path):
+    """A stalled run must be distinguishable from a slow one."""
+    from morph.agent import AgentEvent
+    from morph.trace import ProgressFile
+
+    target = tmp_path / "progress.json"
+    progress = ProgressFile(target)
+    progress.update(phase="editing", iteration=2)
+
+    first = json.loads(target.read_text())
+    assert first["phase"] == "editing"
+    assert first["iteration"] == 2
+    assert "updated_at" in first and "elapsed_s" in first
+
+    progress.observe(
+        AgentEvent("tool_use", {"step": 4, "name": "edit_file", "arguments": {"path": "a.py"}})
+    )
+    second = json.loads(target.read_text())
+    assert second["step"] == 4
+    assert "edit_file" in second["activity"]
+    assert second["updated_at"] >= first["updated_at"]
+
+    progress.observe(AgentEvent("tool_result", {"ok": False, "duration_ms": 1, "content": "no"}))
+    assert json.loads(target.read_text())["last_tool_ok"] is False
+
+
+def test_R_718_progress_never_breaks_the_run_it_reports_on(tmp_path):
+    """Reporting is a nicety; it must not be able to kill an hour of work."""
+    from morph.trace import ProgressFile
+
+    # A path that cannot be written to.
+    blocked = tmp_path / "a-file" / "progress.json"
+    (tmp_path / "a-file").write_text("not a directory")
+
+    progress = ProgressFile(blocked)
+    progress.update(phase="editing")  # must not raise
+    assert progress.state["phase"] == "editing"
+
+
+def test_R_718_loop_streams_the_agent_rather_than_awaiting_it():
+    from selfimprove import loop
+
+    source = Path(loop.__file__).read_text("utf-8")
+    assert "_run_traced" in source
+    assert "agent.stream(" in source, "agent.run() hides every step until the end"
+    assert "tracer.event(event)" in source
+    assert "progress.observe(event)" in source
+
+
+def test_R_718_benchmark_reports_each_task_as_it_finishes():
+    from bench import runner
+
+    source = Path(runner.__file__).read_text("utf-8")
+    assert "tracer" in source
+    assert "tracer.header(f\"{suite} suite\")" in source
+    assert "run_benchmark" in source and "trace: bool = True" in source
+
+
+def test_R_718_dashboard_shows_a_run_in_flight(repo_root):
+    html = (repo_root / "site" / "index.html").read_text("utf-8")
+    app = (repo_root / "site" / "app.js").read_text("utf-8")
+
+    assert 'id="live"' in html
+    assert "pollLiveRun" in app
+    assert "api.github.com" in app, "the committed snapshot cannot know about a live run"
+    assert "in_progress" in app
+    # It must degrade silently: no token, rate limits, private repos, offline.
+    body = app.split("async function pollLiveRun", 1)[1][:2500]
+    assert "catch" in body, "a failed poll must never break the page"
+    assert "banner.hidden = true" in body, "no live run means no banner"

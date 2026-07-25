@@ -277,6 +277,8 @@ function render(data) {
     `Commit ${data.commit}${model ? ` · measured against ${model}` : ""} · ` +
     `updated ${new Date(data.generated_at * 1000).toLocaleString()}.`;
 
+  pollLiveRun(data.repo);
+
   if (data.repo) {
     const links = $("#links");
     [["Repository", data.repo], ["Releases", `${data.repo}/releases`], ["Runs", `${data.repo}/actions`]]
@@ -288,6 +290,49 @@ function render(data) {
         links.appendChild(link);
       });
   }
+}
+
+/* ------------------------------------------------------------ live runs */
+
+/* The committed data is a snapshot from the end of the last run, so it cannot
+ * show a run that is happening now. The public GitHub API can. It needs no
+ * token for a public repository, and if it is unavailable — rate limit, private
+ * repo, offline — the banner simply stays hidden. */
+async function pollLiveRun(repoUrl) {
+  const match = /github\.com\/([^/]+)\/([^/]+)/.exec(repoUrl || "");
+  if (!match) return;
+  const [, owner, repo] = match;
+  const banner = $("#live");
+
+  async function check() {
+    try {
+      const response = await fetch(
+        `https://api.github.com/repos/${owner}/${repo}/actions/runs?per_page=10`,
+        { headers: { Accept: "application/vnd.github+json" }, cache: "no-store" }
+      );
+      if (!response.ok) return;
+      const runs = (await response.json()).workflow_runs || [];
+      const active = runs.find((r) => r.status === "in_progress" || r.status === "queued");
+
+      if (!active) {
+        banner.hidden = true;
+        return;
+      }
+      const minutes = Math.floor((Date.now() - new Date(active.run_started_at)) / 60000);
+      $("#live-title").textContent =
+        `${active.name} #${active.run_number} is ${active.status.replace("_", " ")}`;
+      $("#live-detail").textContent =
+        `Started ${minutes} min ago on ${(active.head_sha || "").slice(0, 7)}. ` +
+        "This page shows the last completed run until it finishes.";
+      banner.href = active.html_url;
+      banner.hidden = false;
+    } catch {
+      /* the banner is a nicety; never let it break the page */
+    }
+  }
+
+  check();
+  setInterval(check, 45000);
 }
 
 fetch("data/dashboard.json", { cache: "no-store" })

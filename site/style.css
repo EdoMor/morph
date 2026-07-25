@@ -255,3 +255,35 @@ footer p { margin: 4px 0; }
 @media (prefers-reduced-motion: reduce) {
   * { animation: none !important; transition: none !important; }
 }
+
+
+/* ----------------------------------------------------------- live banner */
+.live {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 14px 18px;
+  margin-bottom: 20px;
+  border: 1px solid var(--accent);
+  border-radius: var(--radius);
+  background: color-mix(in srgb, var(--accent) 8%, var(--surface));
+  color: var(--text);
+  text-decoration: none;
+  flex-wrap: wrap;
+}
+.live .live-text { flex: 1; min-width: 12rem; display: flex; flex-direction: column; }
+.live .live-text .hint { margin: 0; }
+.live .live-go { color: var(--accent); font-size: 0.875rem; white-space: nowrap; }
+
+.pulse {
+  width: 10px; height: 10px; flex: none;
+  border-radius: 50%;
+  background: var(--accent);
+  box-shadow: 0 0 0 0 color-mix(in srgb, var(--accent) 70%, transparent);
+  animation: pulse 2s infinite;
+}
+@keyframes pulse {
+  70% { box-shadow: 0 0 0 10px transparent; }
+  100% { box-shadow: 0 0 0 0 transparent; }
+}
+@media (prefers-reduced-motion: reduce) { .pulse { animation: none; } }

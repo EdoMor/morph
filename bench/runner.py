@@ -37,6 +37,7 @@ from morph.llm import get_provider
 from morph.llm.echo import EchoProvider
 from morph.skills import SkillRegistry
 from morph.tools import build_default_registry
+from morph.trace import ProgressFile, TraceRenderer
 
 from .scorecard import CAPABILITY_CATEGORIES, CheckResult, Scorecard
 from .tasks import ALL_TASKS, ROBUSTNESS_CHECKS, SUITES
@@ -245,15 +246,43 @@ async def run_task(task: Task, config: Config) -> tuple[CheckResult, dict[str, A
 
 
 async def run_capability_suites(
-    scorecard: Scorecard, config: Config, only: str | None = None
+    scorecard: Scorecard,
+    config: Config,
+    only: str | None = None,
+    tracer: TraceRenderer | None = None,
+    progress: ProgressFile | None = None,
 ) -> list[dict[str, Any]]:
+    """Run the capability tasks, reporting each one as it finishes.
+
+    Against a real model this is most of the run's wall time. Printing a line
+    per task is the difference between a benchmark you can watch and forty
+    silent minutes (R-718).
+    """
     timings: list[dict[str, Any]] = []
     tasks = ALL_TASKS if only is None else SUITES.get(only, [])
-    for task in tasks:
+    suite = None
+
+    for index, task in enumerate(tasks, 1):
+        if tracer and task.category != suite:
+            suite = task.category
+            tracer.header(f"{suite} suite")
+        if progress:
+            progress.update(activity=f"benchmark {index}/{len(tasks)}: {task.label}")
+
         check, timing = await run_task(task, config)
         scorecard.add(check)
         if timing:
             timings.append(timing)
+
+        if tracer:
+            if check.skipped:
+                tracer.note(f"[{index:>2}/{len(tasks)}] {task.label}  skipped")
+            else:
+                mark = "solved" if check.passed else "      "
+                tracer.note(
+                    f"[{index:>2}/{len(tasks)}] {task.label}  {check.score:.2f} {mark}"
+                    f"  {check.duration_ms / 1000:.0f}s"
+                )
     return timings
 
 
@@ -455,9 +484,16 @@ async def run_benchmark(
     repo: Path = REPO_ROOT,
     skip_requirements: bool = False,
     only: str | None = None,
+    trace: bool = True,
+    progress: ProgressFile | None = None,
 ) -> Scorecard:
-    """Run every category and return the scorecard."""
+    """Run every category and return the scorecard.
+
+    ``trace`` prints progress to stderr as each suite and task completes;
+    stdout stays clean for the scorecard JSON that CI pipes into a file.
+    """
     cfg = config or Config(workspace=repo, provider="echo", image_backend="stub")
+    tracer = TraceRenderer() if trace else None
     scorecard = Scorecard(
         metadata={
             "provider": cfg.provider,
@@ -477,12 +513,33 @@ async def run_benchmark(
     )
 
     if not skip_requirements:
+        if tracer:
+            tracer.header("conformance suite")
         run_requirements(scorecard, repo)
-    timings = await run_capability_suites(scorecard, cfg, only=only)
+        if tracer:
+            gate = scorecard.by_category("requirements")
+            failed = [r for r in gate if not r.passed]
+            tracer.note(
+                f"{len(gate) - len(failed)}/{len(gate)} tests pass"
+                + (f" — FAILING: {failed[0].name}" if failed else "")
+            )
+
+    timings = await run_capability_suites(
+        scorecard, cfg, only=only, tracer=tracer, progress=progress
+    )
+
     if only is None:
+        if tracer:
+            tracer.header("robustness")
         await run_robustness(scorecard)
+        if tracer:
+            checks = scorecard.by_category("robustness")
+            tracer.note(f"{sum(1 for r in checks if r.passed)}/{len(checks)} survived")
+
     run_efficiency(scorecard, timings)
     run_health(scorecard, repo)
+    if tracer:
+        tracer.note(f"composite {scorecard.composite:.1f}/100")
     return scorecard
 
 
@@ -503,7 +560,10 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Skip the pytest gate (useful when the benchmark is invoked from pytest)",
     )
-    parser.add_argument("--quiet", action="store_true")
+    parser.add_argument("--quiet", action="store_true", help="Do not print the scorecard")
+    parser.add_argument(
+        "--no-trace", action="store_true", help="Do not print per-task progress to stderr"
+    )
     args = parser.parse_args(argv)
 
     config = Config(
@@ -518,6 +578,7 @@ def main(argv: list[str] | None = None) -> int:
             config,
             skip_requirements=args.skip_requirements or args.only is not None,
             only=args.only,
+            trace=not args.no_trace,
         )
     )
 

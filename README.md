@@ -233,6 +233,51 @@ Three operational notes:
   ephemeral, so without this the loop would forget every previous attempt at the
   end of each run and re-try the same dead ends nightly.
 
+## Watching a run
+
+A run takes hours, so it reports as it goes rather than only at the end.
+
+**In the GitHub Actions log** — open the running `self-improve` job and you get a
+live trace of every step:
+
+```
+──── iteration 1 — ollama/gemma3:4b ────────────────────────────────────
+  10:56:00    0.0s  base c37fd7a7, score to beat 62.0
+  10:56:00    0.0s           · Let me find the bug.
+  10:56:00    0.0s           ! tool call could not be parsed (retrying)
+  10:56:00    0.0s  step  2  → grep(pattern='def average', path='.')
+  10:56:00    0.0s           ← ok     0.0s  calc.py:1: def average(values):
+  10:56:00    0.0s  step  4  → edit_file(path='calc.py', old_string='return sum…')
+  10:56:00    0.0s           ← ok     0.0s  Edited calc.py (1 replacement)
+  10:56:01    0.9s           ⤷ end_turn after 6 step(s), 4 tool call(s)
+```
+
+The benchmark reports per task too — against a real model that is most of the
+wall clock, and it used to be forty silent minutes:
+
+```
+──── skills suite ──────────────────────────────────────────────────────
+  [ 1/8] skills/T1/load-a-skill              1.00 solved   3s
+  [ 2/8] skills/T2/follow-a-skill            0.57          48s
+```
+
+**As a heartbeat** — `selfimprove/progress.json` is rewritten on every event and
+uploaded as a run artefact, so a stalled run is distinguishable from a slow one
+by whether its `updated_at` is still moving.
+
+**On the dashboard** — a banner appears while a run is in flight, with a link
+straight to the live log.
+
+All trace output goes to stderr; stdout stays clean for the JSON that CI pipes
+into a file.
+
+Run it locally and watch the same thing:
+
+```bash
+python -m selfimprove.loop --iterations 1 --dry-run    # trace on stderr
+python -m bench.runner --only coding                   # per-task progress
+```
+
 ## Progress dashboard
 
 Live scoreboard: **https://edomor.github.io/morph/** — current score, category

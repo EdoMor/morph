@@ -209,6 +209,7 @@ jobs:
             loop-output.json
             publish-result.json
             selfimprove/history.jsonl
+            selfimprove/progress.json
           if-no-files-found: warn
 
   # One downloadable, installable release per version the loop cut this run.

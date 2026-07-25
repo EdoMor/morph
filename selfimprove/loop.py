@@ -27,6 +27,7 @@ from bench.scorecard import compare
 from morph.agent import Agent
 from morph.config import Config
 from morph.llm import get_provider
+from morph.trace import ProgressFile, TraceRenderer
 
 from .guard import violations
 from .prompts import SYSTEM_PROMPT, append_history, build_improvement_prompt, load_history
@@ -36,6 +37,7 @@ log = logging.getLogger("selfimprove")
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 HISTORY_PATH = REPO_ROOT / "selfimprove" / "history.jsonl"
+PROGRESS_PATH = REPO_ROOT / "selfimprove" / "progress.json"
 WORKTREE_ROOT = Path(".morph") / "worktrees"
 AGENT_MAX_STEPS = 60
 AGENT_TIMEOUT = 3600.0
@@ -169,6 +171,7 @@ async def run_iteration(
     dry_run: bool = False,
     focus: str | None = None,
     keep_worktree: bool = False,
+    progress_file: ProgressFile | None = None,
 ) -> Iteration:
     """One full cycle: edit in isolation, measure, keep or revert.
 
@@ -180,6 +183,18 @@ async def run_iteration(
     base_commit = git(repo, "rev-parse", "HEAD")
     branch = f"selfimprove/iter-{index}-{int(time.time())}"
     worktree = _create_worktree(repo, branch, base_commit)
+
+    tracer = TraceRenderer()
+    progress = progress_file or ProgressFile(PROGRESS_PATH)
+    tracer.header(f"iteration {index} — {config.provider}/{config.model}")
+    tracer.note(f"base {base_commit[:8]}, score to beat {baseline.get('composite', 0):.1f}")
+    progress.update(
+        phase="editing",
+        iteration=index,
+        base_commit=base_commit[:8],
+        score_before=baseline.get("composite", 0.0),
+        activity="building the prompt",
+    )
 
     iteration = Iteration(
         index=index,
@@ -212,8 +227,8 @@ async def run_iteration(
             system_prompt=SYSTEM_PROMPT,
         )
         try:
-            result = await asyncio.wait_for(
-                agent.run(prompt, max_steps=AGENT_MAX_STEPS), timeout=AGENT_TIMEOUT
+            result = await _run_traced(
+                agent, prompt, AGENT_MAX_STEPS, tracer, progress, AGENT_TIMEOUT
             )
         finally:
             await agent.close()
@@ -243,6 +258,8 @@ async def run_iteration(
             iteration.score_after = 0.0
             return iteration
 
+        tracer.note(f"changed {len(iteration.files_changed)} file(s); re-measuring")
+        progress.update(phase="measuring", activity="running the benchmark on the result")
         after = await measure(worktree, config)
         iteration.score_after = after.get("composite", 0.0)
         iteration.deltas = compare(baseline, after)
@@ -262,6 +279,7 @@ async def run_iteration(
             iteration.rejection_reason = "(dry run: not merged)"
             return iteration
 
+        tracer.note(f"ACCEPTED {iteration.score_before:.1f} -> {iteration.score_after:.1f}")
         _commit_and_merge(repo, worktree, branch, iteration)
 
         # Every accepted iteration is a new version of the agent, cut before the
@@ -293,10 +311,45 @@ async def run_iteration(
         return iteration
     finally:
         iteration.duration_s = time.perf_counter() - started
+        if not iteration.accepted and iteration.rejection_reason:
+            tracer.note(f"rejected: {iteration.rejection_reason}")
+        progress.update(
+            phase="idle",
+            activity=("accepted " + iteration.tag) if iteration.accepted else "rejected",
+            accepted=iteration.accepted,
+            score_after=iteration.score_after,
+        )
         if keep_worktree:
             log.info("Worktree kept for inspection: %s (branch %s)", worktree, branch)
         else:
             _remove_worktree(repo, worktree, branch)
+
+
+async def _run_traced(
+    agent: Agent,
+    prompt: str,
+    max_steps: int,
+    tracer: TraceRenderer,
+    progress: ProgressFile,
+    timeout: float,
+):
+    """Drive the agent through its event stream so the run can be watched live.
+
+    ``agent.run()`` returns only the final result; consuming ``agent.stream()``
+    gives the same result plus every step on the way to it (R-718).
+    """
+    from morph.agent import RunResult
+
+    async def consume() -> RunResult:
+        outcome = RunResult()
+        async for event in agent.stream(prompt, max_steps=max_steps):
+            tracer.event(event)
+            progress.observe(event)
+            if event.type == "done":
+                outcome = RunResult(**event.data["result"])
+        return outcome
+
+    return await asyncio.wait_for(consume(), timeout=timeout)
 
 
 def _changed(worktree: Path, base: str) -> list[str]:
@@ -410,8 +463,15 @@ async def run_loop(
     if git(repo, "rev-parse", "--is-inside-work-tree", check=False) != "true":
         raise GitError(f"{repo} is not a git repository; the loop needs git for isolation")
 
+    progress = ProgressFile(Path(history_path).parent / "progress.json"
+                            if history_path else PROGRESS_PATH)
+    progress.update(phase="baseline", activity="scoring the current code", iterations=iterations)
+
+    tracer = TraceRenderer()
+    tracer.header(f"baseline — {cfg.provider}/{cfg.model}")
     baseline = await measure(repo, cfg)
     log.info("Baseline score: %.1f", baseline.get("composite", 0.0))
+    tracer.note(f"baseline composite {baseline.get('composite', 0.0):.1f}")
 
     entries: list[dict[str, Any]] = []
     for index in range(1, iterations + 1):
@@ -425,6 +485,7 @@ async def run_loop(
             dry_run=dry_run,
             focus=focus,
             keep_worktree=keep_worktree,
+            progress_file=progress,
         )
         entry = iteration.to_entry()
         append_history(history_file, entry)  # R-705
@@ -440,8 +501,11 @@ async def run_loop(
         )
 
         if iteration.accepted and not dry_run:
+            progress.update(phase="measuring", activity="re-scoring after acceptance")
             baseline = await measure(repo, cfg)
 
+    progress.update(phase="done", activity=f"{sum(1 for e in entries if e['accepted'])}"
+                    f"/{len(entries)} accepted")
     return entries
 
 

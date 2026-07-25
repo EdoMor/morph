@@ -193,6 +193,18 @@ user controls — including a phone.
   number. Version tags are created **after** publishing succeeds, never before:
   a rebase rewrites every SHA, and a tag made earlier would point at an orphan.
   A tag that already exists is never moved.
+- **R-718** — A run is **watchable while it happens**, not only readable once it
+  is over. A run takes hours; "it is still going" is not a status. Specifically:
+  - the agent's event stream is rendered live — every step, the tool and its
+    arguments, whether the result succeeded, and how long it took;
+  - the benchmark reports each task as it completes, since against a real model
+    that is most of the wall time;
+  - a machine-readable heartbeat (`selfimprove/progress.json`) is updated on
+    every event, so a stalled run is distinguishable from a slow one by whether
+    its timestamp is still moving;
+  - all of this goes to **stderr**, because stdout carries the JSON that CI
+    pipes into a file, and a trace line in the middle of it would corrupt it;
+  - the dashboard shows when a run is in flight and links to its live log.
 - **R-717** — Progress is **public and legible without reading the repository**.
   A GitHub Pages dashboard shows the current score, its category and difficulty
   breakdown, the score over time, the available releases, and **every attempt —

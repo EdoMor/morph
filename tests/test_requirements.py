@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import re
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -707,10 +708,189 @@ def test_R_706_loop_runs_unattended_in_ci(repo_root):
     assert "schedule" in body and "cron" in body
     assert "workflow_dispatch" in body
     assert "selfimprove.loop" in body or "morph improve" in body
+    assert "concurrency" in body, "two evolutions at once would race for the branch"
 
     devcontainer = repo_root / ".devcontainer" / "devcontainer.json"
     assert devcontainer.is_file()
     assert "ollama" in devcontainer.read_text("utf-8").lower()
+
+
+def test_R_713_workflow_publishes_to_the_default_branch(repo_root):
+    """R-713: evolved code lands on main automatically, with its own gates."""
+    body = (repo_root / ".github" / "workflows" / "self-improve.yml").read_text("utf-8")
+
+    assert "contents: write" in body
+    assert "selfimprove.publish" in body
+    assert "main" in body
+    # The whole run is re-verified, not just each iteration.
+    assert "pytest tests -q" in body
+    assert "REFUSING" in body, "the workflow must refuse to publish a regression"
+    # And it must not have quietly reverted to proposing a PR.
+    assert "gh pr create" not in body
+
+
+def test_R_713_publish_never_force_pushes(repo_root):
+    """Checked against the git arguments the code can actually pass, not its prose."""
+    import ast
+
+    from selfimprove import publish as publish_module
+
+    tree = ast.parse(Path(publish_module.__file__).read_text("utf-8"))
+    literals = {
+        node.value
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Constant) and isinstance(node.value, str)
+    }
+    # Docstrings are string constants too, so match whole arguments only.
+    arguments = {value for value in literals if value.startswith("-")}
+
+    for forbidden in ("--force", "-f", "--force-with-lease", "--delete"):
+        assert forbidden not in arguments, f"publishing must never pass {forbidden} to git"
+
+
+async def test_R_713_publish_rebases_and_reverifies_before_pushing(tmp_path):
+    """The branch moving mid-run is the normal case, not the exception."""
+    from selfimprove.publish import publish
+
+    origin, clone = _two_repos(tmp_path)
+
+    # Someone else pushes to main while our run is in flight.
+    _commit(origin, "upstream.txt", "theirs", "upstream work")
+    # Meanwhile the loop accepted an iteration locally.
+    _commit(clone, "ours.txt", "ours", "selfimprove: iteration 1")
+
+    verified: list[Path] = []
+
+    def verifier(repo):
+        verified.append(repo)
+        return True, "green"
+
+    result = publish(repo=clone, branch="main", remote="origin", verify=verifier)
+
+    assert result.published, result.reason
+    assert result.rebased, "should have rebased onto the moved branch"
+    assert verified, "the suite must be re-run after a rebase, before pushing"
+
+    log = _git(origin, "log", "--oneline")
+    assert "selfimprove: iteration 1" in log
+    assert "upstream work" in log
+
+
+async def test_R_713_publish_aborts_when_the_gate_fails_after_rebase(tmp_path):
+    from selfimprove.publish import publish
+
+    origin, clone = _two_repos(tmp_path)
+    _commit(origin, "upstream.txt", "theirs", "upstream work")
+    _commit(clone, "ours.txt", "ours", "selfimprove: iteration 1")
+
+    result = publish(
+        repo=clone,
+        branch="main",
+        remote="origin",
+        verify=lambda repo: (False, "2 failed"),
+    )
+
+    assert not result.published
+    assert "failed after rebasing" in result.reason
+    assert "selfimprove: iteration 1" not in _git(origin, "log", "--oneline")
+
+
+async def test_R_713_publish_is_a_no_op_when_nothing_was_accepted(tmp_path):
+    from selfimprove.publish import publish
+
+    origin, clone = _two_repos(tmp_path)
+    result = publish(repo=clone, branch="main", remote="origin", verify=None)
+
+    assert not result.published
+    assert "nothing to publish" in result.reason
+
+
+async def test_R_713_publish_stops_on_a_rebase_conflict(tmp_path):
+    """Two sides editing the same line is a human's problem, not the bot's."""
+    from selfimprove.publish import publish
+
+    origin, clone = _two_repos(tmp_path)
+    _commit(origin, "shared.txt", "their version", "upstream edit")
+    _commit(clone, "shared.txt", "our version", "selfimprove: iteration 1")
+
+    result = publish(repo=clone, branch="main", remote="origin", verify=None)
+
+    assert not result.published
+    assert "conflict" in result.reason.lower()
+    assert "human" in result.reason.lower()
+    # The conflict must not be left half-applied in the working tree.
+    assert "rebase" not in _git(clone, "status").lower()
+
+
+def test_R_714_history_is_committed_so_it_outlives_the_runner(tmp_path):
+    """R-714: without this, a scheduled loop forgets every previous attempt."""
+    from selfimprove.publish import record_history
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init", "-q")
+    _git(repo, "config", "user.email", "t@example.com")
+    _git(repo, "config", "user.name", "t")
+    (repo / "seed.txt").write_text("x")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "base")
+
+    assert record_history(repo) is False  # nothing to record yet
+
+    history = repo / "selfimprove" / "history.jsonl"
+    history.parent.mkdir(parents=True)
+    history.write_text('{"iteration": 1, "accepted": false}\n')
+
+    assert record_history(repo) is True
+    assert "history" in _git(repo, "log", "-1", "--format=%s")
+    assert "selfimprove/history.jsonl" in _git(repo, "show", "--name-only", "--format=")
+    assert record_history(repo) is False  # already recorded, nothing new
+
+    # And it must not be gitignored, or the commit above would be a lie.
+    ignored = subprocess.run(
+        ["git", "check-ignore", "selfimprove/history.jsonl"],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert ignored.returncode != 0, "history.jsonl must not be gitignored"
+
+
+# -- helpers for the publish tests -----------------------------------------
+
+
+def _git(repo, *args: str) -> str:
+    result = subprocess.run(
+        ["git", *args], cwd=repo, capture_output=True, text=True, check=False
+    )
+    return result.stdout.strip()
+
+
+def _commit(repo: Path, name: str, content: str, message: str) -> None:
+    (repo / name).write_text(content, "utf-8")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", message)
+
+
+def _two_repos(tmp_path: Path) -> tuple[Path, Path]:
+    """A non-bare 'origin' on branch main, plus a clone of it."""
+    origin = tmp_path / "origin"
+    origin.mkdir()
+    _git(origin, "init", "-q", "-b", "main")
+    _git(origin, "config", "user.email", "t@example.com")
+    _git(origin, "config", "user.name", "t")
+    # Allow pushing to the checked-out branch of a non-bare repo.
+    _git(origin, "config", "receive.denyCurrentBranch", "updateInstead")
+    _commit(origin, "seed.txt", "seed", "initial")
+
+    clone = tmp_path / "clone"
+    subprocess.run(
+        ["git", "clone", "-q", str(origin), str(clone)], capture_output=True, check=True
+    )
+    _git(clone, "config", "user.email", "bot@example.com")
+    _git(clone, "config", "user.name", "bot")
+    return origin, clone
 
 
 def test_R_707_goalposts_are_protected(repo_root):

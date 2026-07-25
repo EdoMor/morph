@@ -1,13 +1,22 @@
 name: self-improve
 
-# Gemma improves Morph on a schedule (R-706).
+# Gemma evolves Morph on GitHub, and commits the result straight to main.
 #
 #   benchmark -> feedback -> Gemma edits the code -> benchmark -> keep or revert
 #
-# Each iteration runs in its own git worktree and is merged only if the
-# conformance suite passes and the composite score did not regress (R-704).
-# Accepted work is pushed to a branch and raised as a PR — a human still decides
-# what lands on the default branch.
+# Each iteration runs in its own git worktree and is merged onto main only if
+# the conformance suite passes, no protected file was touched, and the composite
+# score did not regress (R-704, R-707). Accepted iterations are pushed to main
+# directly — no human in the loop (R-713).
+#
+# What stands between a bad idea and main:
+#   1. the iteration's own gate      — tests green, score held, goalposts intact
+#   2. a whole-run re-check          — suite and benchmark re-run after the loop
+#   3. a post-rebase re-check        — main may have moved; a rebase is a merge
+#   4. no force-push, ever           — a race loses to the human, not the bot
+#
+# To take the loop off main, change `publish_branch` (or set it to a branch name
+# like `selfimprove/nightly` and merge by hand).
 
 on:
   schedule:
@@ -30,17 +39,27 @@ on:
         description: "Optional area to steer this run at"
         required: false
         default: ""
+      publish_branch:
+        description: "Branch to commit evolved code to"
+        required: false
+        default: "main"
+      dry_run:
+        description: "Run the loop and score it, but publish nothing"
+        type: boolean
+        required: false
+        default: false
 
 permissions:
   contents: write
-  pull-requests: write
 
+# Never two evolutions at once: they would race for main and one would waste
+# hours of model time losing the push.
 concurrency:
   group: self-improve
   cancel-in-progress: false
 
 jobs:
-  improve:
+  evolve:
     runs-on: ubuntu-latest
     timeout-minutes: 330
 
@@ -51,10 +70,14 @@ jobs:
       GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
       ITERATIONS: ${{ inputs.iterations || '3' }}
       FOCUS: ${{ inputs.focus }}
+      PUBLISH_BRANCH: ${{ inputs.publish_branch || 'main' }}
 
     steps:
       - uses: actions/checkout@v4
         with:
+          # Evolve the publish branch itself: the loop fast-forwards accepted
+          # iterations onto whatever is checked out.
+          ref: ${{ inputs.publish_branch || 'main' }}
           fetch-depth: 0
 
       - uses: actions/setup-python@v5
@@ -66,9 +89,9 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -e ".[dev]"
 
-      - name: Configure git
+      - name: Identify the committer
         run: |
-          git config user.name "morph-selfimprove"
+          git config user.name "morph-selfimprove[bot]"
           git config user.email "morph-selfimprove@users.noreply.github.com"
 
       - name: Start Ollama and pull Gemma
@@ -82,68 +105,76 @@ jobs:
           done
           ollama pull "${MORPH_MODEL}"
 
+      # Baseline is taken before anything is touched, so the run's net effect on
+      # main is measurable even across several iterations.
       - name: Baseline score
-        run: |
-          python -m bench.runner --output baseline-scorecard.json | tee baseline.txt
+        run: python -m bench.runner --output baseline-scorecard.json | tee baseline.txt
 
-      - name: Run the improvement loop
-        id: loop
+      - name: Record the starting commit
+        id: base
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Evolve
         run: |
           ARGS=(--iterations "${ITERATIONS}" --provider "${MORPH_PROVIDER}" --model "${MORPH_MODEL}")
           if [ -n "${FOCUS}" ]; then ARGS+=(--focus "${FOCUS}"); fi
           python -m selfimprove.loop "${ARGS[@]}" | tee loop-output.json || true
 
-          if git diff --quiet HEAD@{1} HEAD 2>/dev/null; then
-            echo "changed=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "changed=true" >> "$GITHUB_OUTPUT"
+      - name: What changed
+        id: changed
+        run: |
+          COUNT=$(git rev-list --count "${{ steps.base.outputs.sha }}..HEAD")
+          echo "count=${COUNT}" >> "$GITHUB_OUTPUT"
+          echo "### Accepted iterations: ${COUNT}" >> "$GITHUB_STEP_SUMMARY"
+          if [ "${COUNT}" -gt 0 ]; then
+            git log --oneline "${{ steps.base.outputs.sha }}..HEAD" >> "$GITHUB_STEP_SUMMARY"
           fi
 
-      - name: Final score
-        run: |
-          python -m bench.runner --output final-scorecard.json | tee final.txt
-
-      - name: Verify the gate still passes
+      # Gate 2. Every iteration checked itself, but they compose — re-verify the
+      # run as a whole before it goes anywhere near main.
+      - name: Re-verify the conformance suite
+        if: steps.changed.outputs.count != '0'
         run: python -m pytest tests -q
 
-      - name: Push accepted iterations
-        id: push
-        run: |
-          BRANCH="selfimprove/run-${GITHUB_RUN_NUMBER}"
-          if [ -z "$(git log origin/${GITHUB_REF_NAME}..HEAD --oneline)" ]; then
-            echo "No accepted iterations to push."
-            echo "pushed=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          git checkout -b "${BRANCH}"
-          git push -u origin "${BRANCH}"
-          echo "branch=${BRANCH}" >> "$GITHUB_OUTPUT"
-          echo "pushed=true" >> "$GITHUB_OUTPUT"
+      - name: Final score
+        if: steps.changed.outputs.count != '0'
+        run: python -m bench.runner --output final-scorecard.json | tee final.txt
 
-      - name: Open a pull request
-        if: steps.push.outputs.pushed == 'true'
-        env:
-          GH_TOKEN: ${{ github.token }}
+      - name: Refuse to publish a regression
+        if: steps.changed.outputs.count != '0'
         run: |
-          BEFORE=$(python -c "import json;print(json.load(open('baseline-scorecard.json'))['composite'])")
-          AFTER=$(python -c "import json;print(json.load(open('final-scorecard.json'))['composite'])")
+          python - <<'PY'
+          import json, sys
+          before = json.load(open("baseline-scorecard.json"))
+          after = json.load(open("final-scorecard.json"))
+          b, a = before["composite"], after["composite"]
+          print(f"composite {b} -> {a}")
+          if after.get("gated"):
+              sys.exit("REFUSING: conformance gate is failing")
+          if a < b:
+              sys.exit(f"REFUSING: composite regressed across the run ({b} -> {a})")
+          PY
+
+      # Gate 3+4. Rebase onto whatever main is now, re-run the suite, push
+      # without force, retry the race.
+      - name: Publish to ${{ inputs.publish_branch || 'main' }}
+        if: steps.changed.outputs.count != '0' && inputs.dry_run != true
+        run: python -m selfimprove.publish --branch "${PUBLISH_BRANCH}" --attempts 5
+
+      - name: Publish (dry run)
+        if: steps.changed.outputs.count != '0' && inputs.dry_run == true
+        run: python -m selfimprove.publish --branch "${PUBLISH_BRANCH}" --dry-run
+
+      - name: Summarise
+        if: always()
+        run: |
           {
-            echo "Automated self-improvement run #${GITHUB_RUN_NUMBER}."
             echo
-            echo "Composite score: **${BEFORE} → ${AFTER}**"
-            echo
+            echo '### Scorecard'
             echo '```'
-            cat final.txt
+            cat final.txt 2>/dev/null || cat baseline.txt
             echo '```'
-            echo
-            echo "Every commit here was produced by Gemma editing Morph through Morph's own"
-            echo "agent, accepted only after the conformance suite passed and the score held."
-          } > pr-body.md
-          gh pr create \
-            --base "${GITHUB_REF_NAME}" \
-            --head "${{ steps.push.outputs.branch }}" \
-            --title "self-improve: run #${GITHUB_RUN_NUMBER} (${BEFORE} → ${AFTER})" \
-            --body-file pr-body.md
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload artefacts
         if: always()

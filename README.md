@@ -186,10 +186,44 @@ Ollama, pulls Gemma, and verifies the suite. Then:
 python -m selfimprove.loop --iterations 5
 ```
 
-**Actions** — `.github/workflows/self-improve.yml` runs nightly (and on demand).
-It scores the baseline, runs the loop, re-scores, re-runs the gate, pushes
-accepted iterations to a branch, and opens a PR with the before/after scorecard.
-A human still merges.
+**Actions** — `.github/workflows/self-improve.yml` runs nightly (and on demand),
+and **commits evolved code straight to `main`**. No PR, no human in the loop.
+
+```
+checkout main
+  → baseline score
+  → run the loop (each accepted iteration fast-forwards onto local main)
+  → re-verify the whole run: suite green, composite not regressed
+  → rebase onto origin/main if it moved, re-run the suite
+  → push (never forced; a lost race is retried, not overridden)
+```
+
+Four things stand between a bad idea and `main`:
+
+1. **Per-iteration** — tests green, score held, no protected file touched.
+2. **Per-run** — the suite and benchmark run again over all accepted iterations
+   together. Individually safe changes can break in combination.
+3. **Post-rebase** — if `main` moved during the run, the work is rebased onto it
+   and the suite runs *again*. A rebase is a merge, and both sides being green
+   separately proves nothing about the combination.
+4. **Never a force-push.** A race is retried from a fresh fetch; a rebase
+   conflict stops and leaves it for a human. A loop that can overwrite history is
+   one bad iteration away from deleting the project.
+
+Run it with `dry_run: true` to see what it *would* push without pushing.
+
+Three operational notes:
+
+- **Branch protection on `main` will block the bot.** Either exempt the Actions
+  bot, or point `publish_branch` at something like `selfimprove/nightly` and
+  merge by hand.
+- **Pushes made with `GITHUB_TOKEN` do not trigger other workflows**, so `ci.yml`
+  will not run on the bot's commits. The loop already runs that exact suite
+  three times before pushing; add a PAT or deploy key if you want an independent
+  CI run as well.
+- **The attempt history is committed** (`selfimprove/history.jsonl`). Runners are
+  ephemeral, so without this the loop would forget every previous attempt at the
+  end of each run and re-try the same dead ends nightly.
 
 ## Configuration
 
@@ -248,7 +282,7 @@ lines of context, not a hundred documents.
 morph/          agent core, tools, skills, MCP, API, server, CLI
 webapp/         mobile PWA (no build step)
 bench/          scorecard, plus coding / tool_use / mcp / skills / robustness suites
-selfimprove/    the loop, its prompts, and the guard rails
+selfimprove/    the loop, its prompts, the guard rails, and publishing
 tests/          the conformance suite — one test per requirement ID
 ```
 

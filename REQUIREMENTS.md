@@ -150,6 +150,23 @@ user controls — including a phone.
   the model does not repeat a failed approach.
 - **R-706** — The loop runs unattended on GitHub Codespaces / GitHub Actions and
   is safe to run on a schedule.
+- **R-713** — Accepted iterations are **published to the default branch
+  automatically**, as ordinary commits, with no human in the loop. Because
+  nothing downstream reviews them, publishing carries its own guarantees:
+  - the whole run is re-verified after the loop, not just each iteration —
+    iterations compose, and two individually safe changes can break together;
+  - a composite regression across the run refuses to publish, even if every
+    individual iteration was accepted;
+  - if the branch moved during the run, the work is rebased onto it and the
+    conformance suite is **re-run before pushing** — a rebase is a merge;
+  - the push is never forced, and a lost race is retried from a fresh fetch. A
+    loop that can overwrite history is one bad iteration away from deleting the
+    project;
+  - a rebase conflict stops and leaves it for a human rather than guessing.
+- **R-714** — The attempt history survives the machine that produced it. A
+  scheduled loop on ephemeral runners must commit `selfimprove/history.jsonl`,
+  or R-705's "do not repeat a rejected approach" holds only within a single run
+  — which is never the interesting case.
 - **R-707** — The loop must never modify `REQUIREMENTS.md`,
   `tests/test_requirements.py`, `bench/scorecard.py`, `bench/tasks/`, or its own
   acceptance criteria. Any iteration that touches them is rejected outright.

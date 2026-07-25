@@ -233,6 +233,19 @@ Three operational notes:
   ephemeral, so without this the loop would forget every previous attempt at the
   end of each run and re-try the same dead ends nightly.
 
+## Progress dashboard
+
+Live scoreboard: **https://edomor.github.io/morph/** — current score, category
+and difficulty breakdown, score over time, releases, and **every attempt the
+loop made, accepted and rejected, with the reason for each decision**.
+
+The rejected ones are the point. A self-improving system that publishes only its
+successes is advertising, not reporting; the rejections are what shows the guard
+rails working. It is a static page built by `scripts/build_site.py` from data the
+loop already commits, and it refreshes at the end of every run.
+
+Needs Pages switched on once — see [docs/SETUP.md](docs/SETUP.md).
+
 ## Getting it on your phone
 
 Every version the loop produces is published as a GitHub Release with an APK
@@ -322,8 +335,15 @@ webapp/         mobile PWA (no build step)
 bench/          scorecard, plus coding / tool_use / mcp / skills / robustness suites
 selfimprove/    the loop, its prompts, the guard rails, versioning, publishing
 android/        the phone client (WebView shell, built into an APK per version)
+site/           the public progress dashboard (static, GitHub Pages)
 tests/          the conformance suite — one test per requirement ID
 ```
+
+## Repository setup
+
+Four things a workflow cannot do for itself — enabling Pages, checking branch
+protection on `main`, optional APK signing, optional CI on bot commits. All in
+**[docs/SETUP.md](docs/SETUP.md)**.
 
 ## Development
 
@@ -331,6 +351,7 @@ tests/          the conformance suite — one test per requirement ID
 python -m pytest tests -q          # must be green, offline, no credentials
 python -m bench.runner             # full scorecard
 python scripts/make_icons.py       # regenerate PWA icons from icon.svg
+python scripts/build_site.py       # rebuild the dashboard data, then serve site/
 ```
 
 Adding a requirement means adding an `R-###` to `REQUIREMENTS.md` **and** a test

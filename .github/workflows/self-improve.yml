@@ -158,6 +158,12 @@ jobs:
               sys.exit(f"REFUSING: composite regressed across the run ({b} -> {a})")
           PY
 
+      # Committed alongside the history so the Pages dashboard has real data
+      # without re-running an 80-minute benchmark to draw a chart.
+      - name: Record the scorecard for the dashboard
+        if: steps.changed.outputs.count != '0'
+        run: cp final-scorecard.json selfimprove/scorecard.json
+
       # Gate 3+4. Rebase onto whatever main is now, re-run the suite, push
       # without force, retry the race.
       - name: Publish to ${{ inputs.publish_branch || 'main' }}
@@ -165,7 +171,7 @@ jobs:
         if: steps.changed.outputs.count != '0' && inputs.dry_run != true
         run: |
           python -m selfimprove.publish --branch "${PUBLISH_BRANCH}" --attempts 5 \
-            | tee publish-result.json
+            --scorecard selfimprove/scorecard.json | tee publish-result.json
           # Tags are created by publishing, after any rebase settled the SHAs.
           python - <<'PY' >> "$GITHUB_OUTPUT"
           import json, pathlib
@@ -221,3 +227,13 @@ jobs:
     with:
       tag: ${{ matrix.tag }}
     secrets: inherit
+
+  # Refresh the public scoreboard with whatever this run produced.
+  pages:
+    needs: evolve
+    if: always() && needs.evolve.result == 'success'
+    uses: ./.github/workflows/pages.yml
+    permissions:
+      contents: read
+      pages: write
+      id-token: write

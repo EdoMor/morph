@@ -1,0 +1,69 @@
+name: pages
+
+# Publishes the progress dashboard to GitHub Pages (R-717).
+#
+# Called by `self-improve.yml` after a run publishes, so the site refreshes
+# itself as the loop evolves. Also runs on a human push to main and on demand.
+#
+# A reusable workflow rather than only a push trigger: pushes made with
+# GITHUB_TOKEN do not start new workflow runs, so the bot's own commits would
+# never refresh the page.
+
+on:
+  workflow_call:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "site/**"
+      - "scripts/build_site.py"
+      - "selfimprove/history.jsonl"
+      - "selfimprove/scorecard.json"
+      - "CHANGELOG.md"
+      - ".github/workflows/pages.yml"
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Never two deployments at once; a later run always wins.
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0 # tags and dates for the release list
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Build the dashboard data
+        run: python scripts/build_site.py --out site/data/dashboard.json
+
+      - uses: actions/configure-pages@v5
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - id: deploy
+        uses: actions/deploy-pages@v4
+
+      - name: Summarise
+        run: |
+          echo "Dashboard live at ${{ steps.deploy.outputs.page_url }}" >> "$GITHUB_STEP_SUMMARY"

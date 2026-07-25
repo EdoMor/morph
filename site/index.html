@@ -1,0 +1,143 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="theme-color" content="#0b0d10">
+<title>Morph — self-improvement progress</title>
+<meta name="description" content="Live scoreboard for Morph, a coding agent that rewrites its own source code with Gemma.">
+<link rel="icon" href="icon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="masthead">
+  <div class="wrap">
+    <div class="brand">
+      <img src="icon.svg" alt="" width="40" height="40">
+      <div>
+        <h1>Morph</h1>
+        <p class="tagline">A coding agent that rewrites its own source code. Gemma proposes, the benchmark decides.</p>
+      </div>
+    </div>
+    <dl class="headline" id="headline">
+      <div><dt>Version</dt><dd id="hd-version">—</dd></div>
+      <div><dt>Composite score</dt><dd id="hd-score">—</dd></div>
+      <div><dt>Accepted</dt><dd id="hd-accepted">—</dd></div>
+      <div><dt>Model hours</dt><dd id="hd-hours">—</dd></div>
+    </dl>
+  </div>
+</header>
+
+<main class="wrap">
+
+  <div id="empty" class="card empty" hidden>
+    <h2>No runs recorded yet</h2>
+    <p>The loop has not yet published an iteration. Once it does, its score,
+       every accepted and rejected attempt, and the reason for each decision
+       appear here automatically.</p>
+  </div>
+
+  <section id="content" hidden>
+
+    <!-- ---------------------------------------------------------------- -->
+    <section class="card" id="progress-card">
+      <div class="card-head">
+        <h2>Score over time</h2>
+        <p class="hint">Each point is one iteration attempt. Filled markers were
+           accepted and became a version; hollow ones were reverted.</p>
+      </div>
+      <div class="chart-scroll">
+        <svg id="chart" viewBox="0 0 760 260" role="img" aria-labelledby="chart-title">
+          <title id="chart-title">Composite benchmark score across iterations</title>
+        </svg>
+      </div>
+    </section>
+
+    <!-- ---------------------------------------------------------------- -->
+    <div class="grid">
+      <section class="card">
+        <div class="card-head">
+          <h2>Where the points are</h2>
+          <p class="hint">Composite is out of 100. <code>requirements</code> is a
+             gate: if it fails, everything clamps to zero.</p>
+        </div>
+        <div id="categories" class="bars"></div>
+      </section>
+
+      <section class="card">
+        <div class="card-head">
+          <h2>Difficulty frontier</h2>
+          <p class="hint">Mean score per tier, T1 (one tool call) to T5
+             (multi-file, adversarial). The tier where the curve breaks is where
+             the loop has room to work.</p>
+        </div>
+        <div class="table-scroll">
+          <table id="tiers"><thead><tr>
+            <th>suite</th><th>T1</th><th>T2</th><th>T3</th><th>T4</th><th>T5</th><th>frontier</th><th>state</th>
+          </tr></thead><tbody></tbody></table>
+        </div>
+      </section>
+    </div>
+
+    <!-- ---------------------------------------------------------------- -->
+    <section class="card" id="warnings-card" hidden>
+      <div class="card-head">
+        <h2>Benchmark calibration</h2>
+        <p class="hint">A suite where everything passes, or nothing does, has
+           stopped being an instrument. Fixing that means new tasks written by a
+           human — the loop is not allowed to author its own.</p>
+      </div>
+      <ul id="warnings" class="notes"></ul>
+    </section>
+
+    <!-- ---------------------------------------------------------------- -->
+    <section class="card" id="targets-card" hidden>
+      <div class="card-head">
+        <h2>Nearest misses</h2>
+        <p class="hint">Unsolved checks, closest to solved first. This is what
+           the loop's next prompt leads with.</p>
+      </div>
+      <ul id="targets" class="targets"></ul>
+    </section>
+
+    <!-- ---------------------------------------------------------------- -->
+    <section class="card" id="releases-card" hidden>
+      <div class="card-head">
+        <h2>Releases</h2>
+        <p class="hint">Every version carries an installable Android APK.</p>
+      </div>
+      <ul id="releases" class="releases"></ul>
+    </section>
+
+    <!-- ---------------------------------------------------------------- -->
+    <section class="card">
+      <div class="card-head">
+        <h2>Every attempt</h2>
+        <p class="hint">Rejected iterations are kept deliberately: the loop feeds
+           them back into the next prompt so it stops re-trying dead ends.</p>
+      </div>
+      <div class="filters" role="group" aria-label="Filter attempts">
+        <button class="chip is-on" data-filter="all">All</button>
+        <button class="chip" data-filter="accepted">Accepted</button>
+        <button class="chip" data-filter="rejected">Rejected</button>
+      </div>
+      <ol id="attempts" class="attempts"></ol>
+      <div id="reasons" class="reasons"></div>
+    </section>
+
+  </section>
+</main>
+
+<footer class="wrap">
+  <p>
+    Built from <code>selfimprove/history.jsonl</code> and the latest scorecard,
+    both committed by the loop itself.
+    <span id="meta"></span>
+  </p>
+  <p id="links"></p>
+</footer>
+
+<script src="app.js"></script>
+</body>
+</html>

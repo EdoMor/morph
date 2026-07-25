@@ -24,7 +24,7 @@ import json
 import logging
 import subprocess
 import sys
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -130,23 +130,33 @@ def commits_behind(repo: Path, upstream: str) -> list[str]:
     return [line for line in output.splitlines() if line.strip()]
 
 
-def record_history(repo: Path, history: Path | None = None) -> bool:
+def record_history(
+    repo: Path, history: Path | None = None, extra: Sequence[Path] = ()
+) -> bool:
     """Stage and commit the run history so it survives the runner.
 
     Without this the loop forgets every previous attempt the moment the job
     ends, and R-705's "do not repeat a rejected approach" only holds within a
     single run — which on a scheduled loop is almost never the interesting case.
+
+    ``extra`` carries the other run artefacts worth keeping — the scorecard the
+    dashboard reads — in the same commit.
     """
     target = history or (repo / "selfimprove" / "history.jsonl")
-    if not target.is_file():
+    paths = [p for p in [target, *extra] if p.is_file()]
+    if not paths:
         return False
 
-    relative = str(target.relative_to(repo))
-    git(repo, "add", "--", relative, check=False)
+    for path in paths:
+        git(repo, "add", "--", str(path.relative_to(repo)), check=False)
     if not git(repo, "diff", "--cached", "--name-only", check=False):
         return False
 
-    entries = sum(1 for line in target.read_text("utf-8").splitlines() if line.strip())
+    entries = (
+        sum(1 for line in target.read_text("utf-8").splitlines() if line.strip())
+        if target.is_file()
+        else 0
+    )
     git(repo, "commit", "-m", f"selfimprove: record run history ({entries} attempts)")
     return True
 
@@ -237,13 +247,20 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Do not commit selfimprove/history.jsonl",
     )
+    parser.add_argument(
+        "--scorecard",
+        action="append",
+        default=[],
+        help="Extra file to commit with the history (e.g. the dashboard scorecard)",
+    )
     args = parser.parse_args(argv)
 
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
     repo = Path(args.repo)
 
     if not args.no_history:
-        if record_history(repo):
+        extra = [Path(p) if Path(p).is_absolute() else repo / p for p in args.scorecard]
+        if record_history(repo, extra=extra):
             log.info("Recorded run history")
 
     outcome = publish(

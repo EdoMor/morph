@@ -1564,3 +1564,117 @@ def _seed_repo(tmp_path: Path) -> Path:
     _git(repo, "add", "-A")
     _git(repo, "commit", "-qm", "base")
     return repo
+
+
+# ---------------------------------------------------------------------------
+# Public progress dashboard
+# ---------------------------------------------------------------------------
+
+
+def test_R_717_dashboard_is_static_and_self_contained(repo_root):
+    """R-717: no build step, no framework, no third-party fetch."""
+    site = repo_root / "site"
+    for required in ("index.html", "style.css", "app.js", "icon.svg"):
+        assert (site / required).is_file(), f"missing site/{required}"
+
+    html = (site / "index.html").read_text("utf-8")
+    assert 'name="viewport"' in html, "the dashboard must render on a phone"
+    for remote in ("https://cdn", "googleapis", "unpkg", "jsdelivr", "<script src=\"http"):
+        assert remote not in html, f"the page must not load {remote}"
+
+    css = (site / "style.css").read_text("utf-8")
+    assert "overflow-x: hidden" in css
+    assert "@media" in css, "the layout must adapt to narrow screens"
+
+
+def test_R_717_dashboard_reports_failures_not_just_successes(repo_root):
+    """The rejected iterations are the part that shows the guard rails working."""
+    html = (repo_root / "site" / "index.html").read_text("utf-8")
+    app = (repo_root / "site" / "app.js").read_text("utf-8")
+
+    assert "Every attempt" in html
+    assert 'data-filter="rejected"' in html
+    assert "rejection_reason" in app, "each rejection must show why"
+    assert "drawReasons" in app, "the tally of rejection reasons must be shown"
+    # The honest caveats travel with the numbers.
+    assert "calibration" in html.lower()
+    assert "instrument_warnings" in app
+
+
+def test_R_717_build_site_handles_an_empty_repository(tmp_path):
+    """A fresh fork has no history; the builder must not require one."""
+    import sys
+
+    sys.path.insert(0, str(REPO_ROOT / "scripts"))
+    from build_site import build
+
+    repo = tmp_path / "fresh"
+    (repo / "morph").mkdir(parents=True)
+    (repo / "morph" / "__init__.py").write_text('__version__ = "0.1.0"\n')
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+
+    data = build(repo)
+
+    assert data["version"] == "0.1.0"
+    assert data["scorecard"] is None
+    assert data["summary"]["attempts"] == 0
+    assert data["series"] == []
+    assert json.dumps(data), "the payload must be serialisable"
+
+
+def test_R_717_build_site_summarises_real_history(tmp_path):
+    import sys
+
+    sys.path.insert(0, str(REPO_ROOT / "scripts"))
+    from build_site import build
+
+    repo = tmp_path / "withdata"
+    (repo / "morph").mkdir(parents=True)
+    (repo / "morph" / "__init__.py").write_text('__version__ = "0.1.2"\n')
+    (repo / "selfimprove").mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+
+    rows = [
+        {"ts": 100, "score_before": 60.0, "score_after": 60.0, "accepted": False,
+         "rejection_reason": "the agent made no changes", "duration_s": 180},
+        {"ts": 200, "score_before": 60.0, "score_after": 59.0, "accepted": False,
+         "rejection_reason": "score regressed (60.0 -> 59.0)", "duration_s": 2400},
+        {"ts": 300, "score_before": 60.0, "score_after": 64.0, "accepted": True,
+         "version": "0.1.2", "summary": "Fixed it.", "duration_s": 900},
+    ]
+    (repo / "selfimprove" / "history.jsonl").write_text(
+        "".join(json.dumps(r) + "\n" for r in rows)
+    )
+    (repo / "selfimprove" / "scorecard.json").write_text(
+        json.dumps({"composite": 64.0,
+                    "categories": {"coding": {"points": 10.0, "weight": 20}},
+                    "diagnostics": {"coding": {"frontier": 2, "calibration": "healthy"}}})
+    )
+
+    data = build(repo)
+
+    assert data["scorecard"]["composite"] == 64.0
+    assert data["summary"]["attempts"] == 3
+    assert data["summary"]["accepted"] == 1
+    assert data["summary"]["model_hours"] == 1.0  # 3480s, shown to 0.1h
+    # Parameterised reasons collapse so the tally means something.
+    reasons = {r["reason"] for r in data["summary"]["rejection_reasons"]}
+    assert "score regressed" in reasons
+    assert len(data["series"]) == 3
+    assert data["history"][0]["accepted"] is True, "newest first"
+
+
+def test_R_717_pages_workflow_deploys_and_is_callable(repo_root):
+    workflow = repo_root / ".github" / "workflows" / "pages.yml"
+    assert workflow.is_file()
+    body = workflow.read_text("utf-8")
+
+    assert "workflow_call" in body, "self-improve must be able to refresh the site"
+    assert "actions/deploy-pages" in body
+    assert "pages: write" in body and "id-token: write" in body
+    assert "build_site.py" in body
+
+    # And the loop refreshes it, and commits the data the site reads.
+    improve = (repo_root / ".github" / "workflows" / "self-improve.yml").read_text("utf-8")
+    assert "pages.yml" in improve
+    assert "selfimprove/scorecard.json" in improve

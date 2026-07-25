@@ -183,6 +183,14 @@ user controls — including a phone.
   number. Version tags are created **after** publishing succeeds, never before:
   a rebase rewrites every SHA, and a tag made earlier would point at an orphan.
   A tag that already exists is never moved.
+- **R-717** — Progress is **public and legible without reading the repository**.
+  A GitHub Pages dashboard shows the current score, its category and difficulty
+  breakdown, the score over time, the available releases, and **every attempt —
+  accepted and rejected — with the reason for each decision**. A self-improving
+  system that only publishes its successes is not reporting, it is advertising;
+  the rejected iterations are the part that shows the guard rails working. The
+  site is static, built from data the loop already commits, and renders on a
+  phone.
 - **R-716** — Every version is downloadable and installable on a phone. The loop
   builds an Android APK per version and attaches it to a GitHub Release, with
   the APK's `versionName`/`versionCode` derived from `morph.__version__` so the

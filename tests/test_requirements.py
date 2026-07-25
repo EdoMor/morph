@@ -1891,3 +1891,44 @@ def test_R_718_dashboard_shows_a_run_in_flight(repo_root):
     body = app.split("async function pollLiveRun", 1)[1][:2500]
     assert "catch" in body, "a failed poll must never break the page"
     assert "banner.hidden = true" in body, "no live run means no banner"
+
+
+def test_R_719_prompt_distinguishes_repo_bugs_from_benchmark_fixtures():
+    """R-719: three runs were lost to the model hunting fixtures in the repo.
+
+    A capability check names files that exist only in a task's temp workspace.
+    Presented without explanation, the model reads them as bug reports about
+    this repository and greps for symbols that were never here.
+    """
+    from selfimprove.prompts import READING_FAILURES, SYSTEM_PROMPT, build_improvement_prompt
+
+    prompt = build_improvement_prompt(
+        requirements="R-001 something",
+        scorecard={"composite": 61.3, "categories": {}},
+        feedback="### coding/T2/fix-edge-case — scored 14%\n14% — average([]) returns 0.0: 0%",
+        history=[],
+    )
+
+    # Prose wraps, so compare on collapsed whitespace.
+    flat = " ".join(prompt.lower().split())
+    guide = " ".join(READING_FAILURES.lower().split())
+    system = " ".join(SYSTEM_PROMPT.lower().split())
+
+    # The distinction itself.
+    assert "not part of this repository" in flat
+    assert "requirements/" in prompt and "coding/" in prompt
+
+    # The exact fixture names that cost three real runs, called out by name.
+    for fixture in ("average()", "auth.py", "hello world"):
+        assert fixture in guide, f"{fixture} misled a real run; name it explicitly"
+
+    # And what to do instead of hunting for them.
+    assert "morph/" in guide
+    assert "do not grep for it here" in guide
+
+    # The system prompt carries the same warning, since it frames every step.
+    assert "not in this repository" in system
+    assert "fixture" in system
+
+    # bench/tasks/ is readable for understanding but never editable.
+    assert "read-only" in guide or "never edit" in guide

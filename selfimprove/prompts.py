@@ -26,11 +26,21 @@ running inside is the same one you are improving.
 
 You have file, search and shell tools. Use them. Never guess at file contents.
 
+Before anything else, understand what you are looking at. Morph is scored partly
+by *benchmark tasks*, in which an agent is given a synthetic job in a throwaway
+directory. Those tasks have fixture files — `calc.py`, `average()`, `auth.py`,
+`greet.py`, `"hello world"` — that are created in a temp directory and thrown
+away. **They are not in this repository.** A failing benchmark task means the
+agent performed badly at that kind of work; it does not mean this repository
+contains the bug described. Improve the agent in `morph/`, not the fixture.
+
 How to work:
 1. Read the failing checks and pick ONE concrete problem. Depth beats breadth —
    a single correct fix that raises the score is worth more than five
    speculative edits that break the build.
 2. Find the relevant code with `grep` and `read_file` before editing anything.
+   If a search returns nothing, that is information: stop and reconsider whether
+   you are looking for the right thing, rather than guessing at another string.
 3. Make the smallest change that fixes the problem.
 4. Run the affected tests with `shell` and confirm they pass.
 5. Finish with a short summary: what you changed, why, and which requirement IDs
@@ -42,6 +52,49 @@ Rules:
 - Do not add new third-party dependencies. Morph has to run on a phone.
 - Do not delete or weaken tests to make them pass.
 - Prefer fixing the cause over widening an exception handler.
+"""
+
+
+#: The single most expensive misreading available. A capability check named
+#: `coding/T2/fix-edge-case` failing does NOT mean Morph has a broken
+#: `average()`; it means the agent was asked to fix one in a scratch directory
+#: and did it badly. Three consecutive runs were lost to a model grepping
+#: morph/agent.py for `average([])`, `auth.py` and `"hello world"` — fixture
+#: strings that exist only inside a temporary workspace.
+READING_FAILURES = """\
+## How to read the failing checks
+
+The prefix of a check name tells you what kind of failure it is, and they need
+completely different responses.
+
+**`requirements/…`** — a real test in `tests/` is failing against this
+repository. Read the test, find the code it covers, fix that code.
+
+**`coding/…`, `tool_use/…`, `mcp/…`, `skills/…`** — these are *benchmark tasks*.
+The agent was given a synthetic job in a throwaway directory and scored on how
+well it did. **The file and symbol names in the detail are fixtures, created
+fresh in a temp directory for that task and deleted afterwards. They are not
+part of this repository.**
+
+> If a detail mentions `calc.py`, `average()`, `auth.py`, `greet.py` or
+> `"hello world"`, do not grep for it here and do not try to edit it. You will
+> find nothing, and you will spend the whole iteration finding nothing.
+
+What a low score on one of these means is: **the agent handled that kind of work
+badly.** The fix is in `morph/` — the agent loop, a tool's behaviour, an error
+message, the system prompt. Ask *why would an agent fail at this?* and improve
+the thing that made it hard. If `coding/T2/fix-edge-case` scores 14%, the
+question is not "where is average()", it is "what about our `read_file` or
+`edit_file` makes a small edit like that go wrong?"
+
+**`robustness/…`** — an error-injection check on real Morph code. The detail
+says exactly what broke. These are directly actionable.
+
+**`efficiency/…`, `health/…`** — measured over this repository as a whole.
+
+The benchmark task definitions live in `bench/tasks/` and are read-only to you.
+Read them to understand what a task is asking — that is often the fastest way to
+see what the agent is up against — but never edit them.
 """
 
 
@@ -95,6 +148,7 @@ def build_improvement_prompt(
             )
     sections.append("\n".join(lines))
 
+    sections.append(READING_FAILURES)
     sections.append(f"## What is failing\n\n{feedback}")
 
     if history:

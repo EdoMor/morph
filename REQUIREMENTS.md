@@ -242,6 +242,14 @@ requirements are about the *instrument*, not the system under test.
   loop needs — "parses, preserves old behaviour, misses the edge case" must
   score above "deleted the file". Rubrics must include critical criteria such
   that a destructive answer can never out-score a partial one.
+- **R-719** — The feedback handed to the model must make clear **what kind of
+  failure each check is**. A capability check (`coding/…`, `tool_use/…`,
+  `mcp/…`, `skills/…`) failing means the agent performed badly on a synthetic
+  task whose fixtures live in a temporary directory — not that this repository
+  contains the bug described in the detail. Without that distinction the model
+  reads `average([]) raised ZeroDivisionError` as a bug report, greps the
+  repository for `average`, finds nothing, and spends the iteration hunting a
+  file that never existed. Three consecutive runs were lost to exactly this.
 - **R-710** — The benchmark reports a **frontier** per suite: the hardest tier
   the system reliably handles. It also reports the **nearest misses** — unsolved
   checks ordered easiest-and-closest first — and the loop's prompt leads with

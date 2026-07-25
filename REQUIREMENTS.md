@@ -151,8 +151,41 @@ user controls — including a phone.
 - **R-706** — The loop runs unattended on GitHub Codespaces / GitHub Actions and
   is safe to run on a schedule.
 - **R-707** — The loop must never modify `REQUIREMENTS.md`,
-  `tests/test_requirements.py`, `bench/scorecard.py`, or its own acceptance
-  criteria. Any iteration that touches them is rejected outright.
+  `tests/test_requirements.py`, `bench/scorecard.py`, `bench/tasks/`, or its own
+  acceptance criteria. Any iteration that touches them is rejected outright.
+  Authoring benchmark tasks is included deliberately: a loop that can write its
+  own tasks will write easy ones, which is the same failure as editing the
+  scorer, one level down.
+
+## 7b. Benchmark calibration (R-70x)
+
+A self-improving loop is only as good as the gradient it climbs. These
+requirements are about the *instrument*, not the system under test.
+
+- **R-708** — Every capability suite (`coding`, `tool_use`, `mcp`, `skills`)
+  must span five difficulty tiers, T1 (one tool call) to T5 (multi-file,
+  adversarial, or requiring a plan), with at least one task at each of T1-T5 and
+  no tier holding more than half the suite. If every task is the same difficulty
+  there is no gradient: the loop either solves them all and stops learning, or
+  solves none and gets no signal.
+- **R-709** — Capability tasks are graded on a rubric of weighted criteria and
+  score continuously in `[0, 1]`. Binary pass/fail discards the information the
+  loop needs — "parses, preserves old behaviour, misses the edge case" must
+  score above "deleted the file". Rubrics must include critical criteria such
+  that a destructive answer can never out-score a partial one.
+- **R-710** — The benchmark reports a **frontier** per suite: the hardest tier
+  the system reliably handles. It also reports the **nearest misses** — unsolved
+  checks ordered easiest-and-closest first — and the loop's prompt leads with
+  them. Pointing the model at the hardest failure is how a loop stalls.
+- **R-711** — The benchmark diagnoses its own calibration per suite and says so
+  in the scorecard: `saturated` (everything passes — cannot show progress),
+  `floored` (almost nothing passes — improvements will not register), `partial`
+  (some checks did not run, so calibration cannot be judged), or `healthy`.
+  A saturated or floored suite is a broken instrument, and the fix is new tasks
+  by a human — which is why R-707 forbids the loop from writing them.
+- **R-712** — Tasks that cannot run in a given mode are **skipped**, not scored
+  zero. A deterministic replay of reference traces must not be presentable as a
+  capability measurement.
 
 ## 8. Engineering quality (R-8xx)
 
@@ -175,11 +208,22 @@ The benchmark (`python -m bench.runner`) produces a composite score in `[0, 100]
 
 | Category | Weight | Signal |
 | --- | --- | --- |
-| `requirements` | 40 | fraction of `tests/` passing |
-| `capability` | 30 | fraction of `bench/tasks/` agent tasks solved |
-| `robustness` | 15 | error-injection tasks survived |
-| `efficiency` | 10 | steps & wall-time vs. per-task budget |
-| `health` | 5 | import cleanliness, type hints, dead code |
+| `requirements` | 25 | fraction of `tests/` passing — **the gate** |
+| `coding` | 20 | agent tasks: change software correctly (T1-T5) |
+| `tool_use` | 15 | agent tasks: tool selection, precision, restraint, recovery (T1-T5) |
+| `mcp` | 12 | agent tasks: use tools discovered at runtime from MCP servers (T1-T5) |
+| `skills` | 12 | agent tasks: find, load and follow packaged instructions (T1-T5) |
+| `robustness` | 10 | error-injection checks survived |
+| `efficiency` | 4 | steps & wall-time vs. per-task budget |
+| `health` | 2 | import cleanliness, type hints, dead code |
 
 `requirements` is a **gate**: if any test in `tests/test_requirements.py` fails,
 the composite score is clamped to 0 and the iteration cannot be accepted.
+
+Capability checks are weighted by difficulty tier — T1:1, T2:2, T3:3, T4:5,
+T5:8 — so the score reflects *what* was solved, not just how many. The weights
+are deliberately sub-exponential: a system that solves every T1-T2 and nothing
+else still earns a visible score, which is what makes early progress legible.
+
+A task counts as **solved** at 80% of its rubric, leaving room for stylistic
+variation without rewarding a near-miss as a win.

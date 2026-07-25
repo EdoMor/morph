@@ -75,6 +75,7 @@ ASGI stack to build on-device.
 
 ```bash
 python -m bench.runner                      # score the current code
+python -m bench.runner --only mcp           # one suite, for a fast iteration
 python -m selfimprove.loop --iterations 3   # let Gemma try to raise it
 python -m selfimprove.loop --dry-run        # measure without merging
 ```
@@ -97,24 +98,84 @@ Each iteration:
 
 | Category | Weight | What it measures |
 | --- | --- | --- |
-| `requirements` | 40 | `tests/` — also a **gate**: red suite clamps the score to 0 |
-| `capability` | 30 | seven end-to-end agent tasks (fix a bug, search, run tests, generate an image, use a skill…) |
-| `robustness` | 15 | twelve error-injection checks (path escape, dead MCP server, runaway loop…) |
-| `efficiency` | 10 | steps and wall time against per-task budgets |
-| `health` | 5 | parses, imports, annotations, no swallowed exceptions |
+| `requirements` | 25 | `tests/` — also a **gate**: red suite clamps the score to 0 |
+| `coding` | 20 | change software correctly |
+| `tool_use` | 15 | tool selection, argument precision, restraint, recovery |
+| `mcp` | 12 | use tools discovered at runtime from MCP servers |
+| `skills` | 12 | find, load and actually follow packaged instructions |
+| `robustness` | 10 | twelve error-injection checks (path escape, dead MCP server, runaway loop…) |
+| `efficiency` | 4 | steps and wall time against per-task budgets |
+| `health` | 2 | parses, imports, annotations, no swallowed exceptions |
+
+### Keeping the benchmark climbable
+
+A self-improving loop is only as good as the gradient it climbs. A suite where
+everything passes teaches nothing; so does one where nothing does. Three things
+keep the instrument usable:
+
+**Difficulty tiers.** Each of the four capability suites spans T1-T5 — from one
+tool call to multi-file adversarial work — so at any level of competence some
+tasks are solved, some are borderline, and some are out of reach. The borderline
+band *is* the signal. Checks are weighted T1:1, T2:2, T3:3, T4:5, T5:8, so the
+score reflects what was solved, not just how many.
+
+**Graded rubrics, not pass/fail.** Every task scores continuously in `[0, 1]`
+against weighted criteria. "Parses, preserves old behaviour, misses the edge
+case" scores above "deleted the file", so a half-finished iteration is
+distinguishable from a wasted one. Criteria marked *critical* — "the tests were
+not edited", "existing behaviour intact" — **gate** the task rather than scoring
+it: they zero a destructive answer, but earn nothing, because an agent that does
+nothing at all would otherwise collect them for free.
+
+Driving the real suites with progressively truncated reference traces (a
+stand-in for models of increasing competence) gives:
+
+| competence | mean score | solved | distinct scores |
+| --- | --- | --- | --- |
+| 0% | 0.11 | 0/29 | 9 |
+| 50% | 0.41 | 6/29 | 18 |
+| 75% | 0.83 | 21/29 | 11 |
+| 100% | 1.00 | 29/29 | 1 |
+
+Monotonic, with a near-zero floor and real resolution in the middle. That
+property is itself a test — `test_R_709_benchmark_discriminates_between_competence_levels`
+fails if the rubrics ever collapse back toward binary.
+
+**Self-diagnosis.** The scorecard reports, per suite, a **frontier** (the hardest
+tier handled reliably), the **nearest misses** (unsolved checks ordered
+easiest-and-closest first — what the loop's prompt leads with, because pointing a
+model at the hardest failure is how a loop stalls), and a **calibration** verdict:
+
+- `healthy` — some solved, some not; the loop has somewhere to go
+- `saturated` — everything passes; the suite can no longer show progress
+- `floored` — almost nothing passes; improvements will not register
+- `partial` — some checks did not run, so calibration cannot be judged
+
+`saturated` and `floored` mean the benchmark is broken as an instrument, and the
+fix is new tasks written by a human — which is why the loop is forbidden from
+touching `bench/tasks/`.
 
 > **Reading the score.** With `--provider echo` the capability tasks replay
-> reference traces, so a green run reports 100/100. That measures the *harness*,
-> not a model — it is the CI smoke test. The number that matters comes from
-> running the benchmark against real Gemma, where capability is earned.
+> reference traces where one exists and are *skipped* where none does — never
+> scored zero, since a replay must not pose as a measurement. A green echo run
+> reports 100/100 and flags every suite `partial`. That measures the harness. The
+> number that matters comes from running against real Gemma.
 
 ### Why the goalposts are protected
 
 A system that can edit its own scorer will optimise by editing its scorer. So
-`REQUIREMENTS.md`, `tests/test_requirements.py`, `bench/scorecard.py` and the
-loop itself are off limits (`selfimprove/guard.py`), and any iteration that
-touches them is rejected in full — not partially credited. If the model thinks a
-requirement is wrong, it says so in its summary and a human decides.
+`REQUIREMENTS.md`, `tests/test_requirements.py`, `bench/scorecard.py`,
+**`bench/tasks/`** and the loop itself are off limits (`selfimprove/guard.py`),
+and any iteration that touches them is rejected in full — not partially
+credited.
+
+The task suites are on that list deliberately. A loop allowed to author its own
+benchmark tasks will author easy ones, which is the same failure as editing the
+scorer, one level down. Growing the benchmark stays a human's job; the
+calibration verdict tells the human when it needs growing.
+
+If the model thinks a requirement is wrong, it says so in its summary and a
+human decides.
 
 ## Running the loop on GitHub
 
@@ -186,7 +247,7 @@ lines of context, not a hundred documents.
 ```
 morph/          agent core, tools, skills, MCP, API, server, CLI
 webapp/         mobile PWA (no build step)
-bench/          scorecard + capability, robustness, efficiency, health suites
+bench/          scorecard, plus coding / tool_use / mcp / skills / robustness suites
 selfimprove/    the loop, its prompts, and the guard rails
 tests/          the conformance suite — one test per requirement ID
 ```

@@ -24,14 +24,16 @@ from selfimprove.prompts import build_improvement_prompt
 
 
 def _card(**counts: tuple[int, int]) -> Scorecard:
+    """Build a scorecard with `passed` of `total` checks solved per category."""
     card = Scorecard()
     for category, (passed, total) in counts.items():
         for index in range(total):
             card.add(
-                CheckResult(
+                CheckResult.binary(
                     name=f"{category}/{index}",
                     category=category,
                     passed=index < passed,
+                    tier=index % 5 + 1,
                 )
             )
     return card
@@ -49,22 +51,46 @@ def test_perfect_scorecard_is_one_hundred():
 
 def test_failing_conformance_clamps_the_score():
     """The gate is the whole point: a red suite cannot be traded for other points."""
-    card = _card(requirements=(9, 10), capability=(5, 5), robustness=(5, 5))
+    card = _card(requirements=(9, 10), coding=(5, 5), robustness=(5, 5))
     assert card.gated
     assert card.composite == 0.0
 
 
 def test_partial_credit_is_weighted():
-    card = _card(requirements=(4, 4), capability=(1, 2))
-    # requirements 40 + capability 15 (half of 30); other categories are empty => 0
-    assert card.composite == pytest.approx(55.0)
+    card = _card(requirements=(4, 4), coding=(1, 2))
+    # requirements 25 + coding 10 (half of 20); other categories are empty => 0
+    assert card.composite == pytest.approx(WEIGHTS["requirements"] + WEIGHTS["coding"] / 2)
 
 
-def test_skipped_tests_neither_help_nor_hurt():
-    """The runner records a skip as passed with weight 0 — it cannot move the score."""
+def test_graded_scores_land_between_pass_and_fail():
+    """The whole point of R-709: half-done must sit between done and nothing."""
+    nothing = Scorecard()
+    nothing.add(CheckResult("coding/x", "coding", score=0.0, tier=3))
+    halfway = Scorecard()
+    halfway.add(CheckResult("coding/x", "coding", score=0.5, tier=3))
+    done = Scorecard()
+    done.add(CheckResult("coding/x", "coding", score=1.0, tier=3))
+
+    assert nothing.composite < halfway.composite < done.composite
+
+
+def test_tier_weighting_favours_harder_tasks():
+    easy = Scorecard()
+    easy.add(CheckResult("coding/a", "coding", score=1.0, tier=1, weight=1.0))
+    easy.add(CheckResult("coding/b", "coding", score=0.0, tier=5, weight=8.0))
+
+    hard = Scorecard()
+    hard.add(CheckResult("coding/a", "coding", score=0.0, tier=1, weight=1.0))
+    hard.add(CheckResult("coding/b", "coding", score=1.0, tier=5, weight=8.0))
+
+    assert hard.composite > easy.composite
+
+
+def test_pytest_skips_neither_help_nor_hurt():
+    """The runner records a pytest skip as passed with weight 0."""
     card = Scorecard()
-    card.add(CheckResult("passing", "requirements", passed=True, weight=1.0))
-    card.add(CheckResult("skipped", "requirements", passed=True, weight=0.0))
+    card.add(CheckResult.binary("passing", "requirements", passed=True, weight=1.0))
+    card.add(CheckResult.binary("skipped", "requirements", passed=True, weight=0.0))
 
     assert card.category_score("requirements") == 1.0
     assert not card.gated
@@ -73,8 +99,8 @@ def test_skipped_tests_neither_help_nor_hurt():
 def test_the_gate_counts_any_non_pass_regardless_of_weight():
     """Weight discounts a check's contribution; it never exempts it from the gate."""
     card = Scorecard()
-    card.add(CheckResult("passing", "requirements", passed=True, weight=1.0))
-    card.add(CheckResult("failing", "requirements", passed=False, weight=0.0))
+    card.add(CheckResult.binary("passing", "requirements", passed=True, weight=1.0))
+    card.add(CheckResult.binary("failing", "requirements", passed=False, weight=0.0))
 
     assert card.category_score("requirements") == 1.0
     assert card.gated
@@ -86,17 +112,31 @@ def test_empty_category_scores_zero():
 
 
 def test_compare_reports_per_category_deltas():
-    before = _card(requirements=(4, 4), capability=(1, 2)).to_dict()
-    after = _card(requirements=(4, 4), capability=(2, 2)).to_dict()
+    before = _card(requirements=(4, 4), coding=(1, 2)).to_dict()
+    after = _card(requirements=(4, 4), coding=(2, 2)).to_dict()
     delta = compare(before, after)
 
-    assert delta["delta"] == pytest.approx(15.0)
-    assert delta["categories"]["capability"] == pytest.approx(15.0)
+    assert delta["delta"] == pytest.approx(WEIGHTS["coding"] / 2)
+    assert delta["categories"]["coding"] == pytest.approx(WEIGHTS["coding"] / 2)
     assert delta["categories"]["requirements"] == 0.0
 
 
+def test_compare_reports_frontier_movement():
+    """A frontier that moves is the headline result of an iteration."""
+    before = Scorecard()
+    before.add(CheckResult("coding/T1/a", "coding", score=1.0, tier=1))
+    before.add(CheckResult("coding/T2/b", "coding", score=0.2, tier=2))
+
+    after = Scorecard()
+    after.add(CheckResult("coding/T1/a", "coding", score=1.0, tier=1))
+    after.add(CheckResult("coding/T2/b", "coding", score=0.9, tier=2))
+
+    moves = compare(before.to_dict(), after.to_dict())["frontier_moves"]
+    assert moves["coding"] == "T1 -> T2"
+
+
 def test_scorecard_round_trips_through_json(tmp_path: Path):
-    card = _card(requirements=(2, 3), capability=(1, 1))
+    card = _card(requirements=(2, 3), coding=(1, 1))
     path = card.write(tmp_path / "sub" / "scorecard.json")
     data = Scorecard.read(path)
 
@@ -109,25 +149,31 @@ def test_render_and_feedback_name_the_failures():
     card = Scorecard()
     card.add(
         CheckResult(
-            "capability/fix-a-bug",
-            "capability",
-            passed=False,
+            "coding/T2/fix-a-bug",
+            "coding",
+            score=0.4,
+            tier=2,
             detail="average([]) still raises ZeroDivisionError",
             requirement_ids=["R-203"],
         )
     )
     rendered = card.render()
-    assert "capability/fix-a-bug" in rendered
-    assert "R-203" in rendered
+    assert "coding/T2/fix-a-bug" in rendered
+    assert "nearest misses" in rendered
 
     feedback = card.feedback()
     assert "ZeroDivisionError" in feedback
     assert "R-203" in feedback
+    assert "40%" in feedback, "the feedback must show how close it got"
 
 
-def test_feedback_when_everything_passes():
+def test_feedback_when_everything_passes_asks_for_harder_tasks():
+    """A saturated benchmark is a broken instrument, and the loop must say so."""
     card = _card(**{cat: (2, 2) for cat in WEIGHTS})
-    assert "efficiency" in card.feedback()
+    feedback = card.feedback()
+
+    assert "needs harder tasks" in feedback
+    assert "human" in feedback
 
 
 # ---------------------------------------------------------------------------
@@ -157,7 +203,7 @@ def test_protected_paths_are_recognised(path: str):
         "morph/agent.py",
         "tests/test_agent.py",
         "bench/runner.py",
-        "bench/tasks/capability.py",
+        "bench/tasks_notes.md",
         "REQUIREMENTS-notes.md",
         "webapp/app.js",
     ],

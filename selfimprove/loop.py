@@ -300,21 +300,72 @@ def _commit_and_merge(repo: Path, worktree: Path, branch: str, iteration: Iterat
 
 
 def _feedback_from(scorecard: dict[str, Any]) -> str:
-    """Rebuild a failure digest from a serialised scorecard."""
-    failures = [r for r in scorecard.get("results", []) if not r.get("passed")]
-    if not failures:
-        return (
-            "Everything passes. Look for improvements to efficiency and health, or add "
-            "capability without breaking anything."
+    """Rebuild a failure digest from a serialised scorecard.
+
+    Leads with the difficulty frontier and the nearest misses rather than a flat
+    list of everything red. Pointing a model at the hardest failure is how a loop
+    stalls; pointing it at the closest one is how it climbs (R-710).
+    """
+    lines = [f"Composite score: {scorecard.get('composite', 0):.1f}/100.", ""]
+
+    if scorecard.get("gated"):
+        lines.append(
+            "**The conformance suite is failing.** The composite is clamped to 0 until "
+            "it is green. Fix that before anything else.\n"
         )
-    lines = [f"Composite score: {scorecard.get('composite', 0):.1f}/100.", "", "Failing checks:"]
-    for failure in failures[:20]:
-        ids = failure.get("requirement_ids") or []
-        suffix = f" (requirements: {', '.join(ids)})" if ids else ""
-        lines.append(f"\n### {failure['name']} [{failure['category']}]{suffix}")
-        lines.append((failure.get("detail") or "(no detail)")[:1500])
-    if len(failures) > 20:
-        lines.append(f"\n… and {len(failures) - 20} further failures.")
+
+    diagnostics = scorecard.get("diagnostics") or {}
+    if diagnostics:
+        lines.append("Difficulty frontier per suite — the tier where you stop being reliable:")
+        for category, data in diagnostics.items():
+            profile = data.get("tier_profile") or {}
+            shape = " ".join(f"T{t}:{v:.2f}" for t, v in sorted(profile.items()))
+            lines.append(
+                f"- **{category}** — frontier T{data.get('frontier', 0)}, "
+                f"{data.get('headroom', 0):.1f} points unearned "
+                f"[{data.get('calibration', '?')}] — {shape}"
+            )
+        lines.append(
+            "\nThe cheapest points are one tier above each frontier. A suite already at "
+            "T5 has nothing left to give; work where the profile drops off."
+        )
+
+    targets = scorecard.get("next_targets") or []
+    if targets:
+        lines += ["", "Nearest misses — closest to solved, attack these first:"]
+        for target in targets:
+            ids = target.get("requirement_ids") or []
+            suffix = f" (requirements: {', '.join(ids)})" if ids else ""
+            tier = f" [tier {target['tier']}]" if target.get("tier") else ""
+            lines.append(
+                f"\n### {target['name']} — scored {target.get('score', 0):.0%}{tier}{suffix}"
+            )
+            lines.append((target.get("detail") or "(no detail)")[:1200])
+
+    target_names = {t.get("name") for t in targets}
+    others = [
+        r
+        for r in scorecard.get("results", [])
+        if not r.get("passed") and not r.get("skipped") and r.get("name") not in target_names
+    ]
+    if others:
+        lines += ["", f"Also failing ({len(others)}):"]
+        for failure in others[:12]:
+            lines.append(
+                f"- {failure['name']} — {failure.get('score', 0):.0%} — "
+                f"{(failure.get('detail') or '')[:180]}"
+            )
+
+    warnings = scorecard.get("instrument_warnings") or []
+    if warnings:
+        lines += ["", "Benchmark calibration (report these; do not try to fix them yourself):"]
+        lines += [f"- {w}" for w in warnings]
+
+    if not others and not targets:
+        lines.append(
+            "\nEverything currently measured passes. Say so in your summary rather than "
+            "inventing a change — the benchmark needs harder tasks, which is a human's call."
+        )
     return "\n".join(lines)
 
 

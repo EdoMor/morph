@@ -62,19 +62,37 @@ def build_improvement_prompt(
 
     composite = scorecard.get("composite", 0.0)
     categories = scorecard.get("categories") or {}
+    diagnostics = scorecard.get("diagnostics") or {}
+
     lines = [f"## Current score: {composite:.1f} / 100", ""]
     if scorecard.get("gated"):
         lines.append(
             "**The conformance suite is failing.** Until `tests/` passes, the composite "
             "score is clamped to 0. Fix that first — nothing else counts.\n"
         )
-    lines.append("| category | points | of | passing |")
-    lines.append("| --- | --- | --- | --- |")
+    lines.append("| category | points | of | solved | frontier |")
+    lines.append("| --- | --- | --- | --- | --- |")
     for name, data in categories.items():
+        frontier = diagnostics.get(name, {}).get("frontier")
+        frontier_cell = f"T{frontier}" if frontier is not None else "—"
         lines.append(
             f"| {name} | {data.get('points', 0):.1f} | {data.get('weight', 0):.0f} | "
-            f"{data.get('passed', 0)}/{data.get('total', 0)} |"
+            f"{data.get('passed', 0)}/{data.get('total', 0)} | {frontier_cell} |"
         )
+
+    if diagnostics:
+        best = max(
+            diagnostics.items(),
+            key=lambda kv: kv[1].get("headroom", 0.0),
+            default=(None, {}),
+        )
+        if best[0] and best[1].get("headroom", 0.0) > 0:
+            lines.append(
+                f"\nMost unearned points sit in **{best[0]}** "
+                f"({best[1]['headroom']:.1f} available, frontier T{best[1].get('frontier', 0)}). "
+                "Tasks are graded on a rubric, so partial progress counts — a fix that "
+                "takes a task from 40% to 70% is real movement, not a wasted iteration."
+            )
     sections.append("\n".join(lines))
 
     sections.append(f"## What is failing\n\n{feedback}")

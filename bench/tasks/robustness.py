@@ -21,7 +21,7 @@ from morph.tools import ToolError, ToolRegistry, build_default_registry
 from morph.tools.files import resolve_in_root
 from morph.tools.image import ImageRequest, get_backend, run_image_flow
 
-from .types import TaskOutcome
+from .spec import TaskOutcome
 
 Check = Callable[[Path], Awaitable[TaskOutcome]]
 

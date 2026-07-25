@@ -1,14 +1,20 @@
 """Benchmark runner: produces the score the self-improvement loop optimises.
 
-    python -m bench.runner [--output scorecard.json]
+    python -m bench.runner [--provider ollama --model gemma3:4b] [--output card.json]
 
-Five categories, defined in :mod:`bench.scorecard`:
+Categories, defined in :mod:`bench.scorecard`:
 
 ``requirements``  the conformance suite in ``tests/`` — also the gate
-``capability``    end-to-end agent tasks
+``coding``        agent tasks: change software correctly (T1-T5)
+``tool_use``      agent tasks: drive the tools well (T1-T5)
+``mcp``           agent tasks: use runtime-discovered MCP tools (T1-T5)
+``skills``        agent tasks: find, load and follow packaged instructions (T1-T5)
 ``robustness``    error injection
 ``efficiency``    steps and wall time against per-task budgets
 ``health``        import cleanliness, annotations, obvious code smells
+
+Expect stderr noise from the robustness suite — it deliberately injects
+failures, and the logging that produces is the system behaving correctly.
 """
 
 from __future__ import annotations
@@ -32,9 +38,9 @@ from morph.llm.echo import EchoProvider
 from morph.skills import SkillRegistry
 from morph.tools import build_default_registry
 
-from .scorecard import CheckResult, Scorecard
-from .tasks import CAPABILITY_TASKS, ROBUSTNESS_CHECKS
-from .tasks.types import AgentTask
+from .scorecard import CAPABILITY_CATEGORIES, CheckResult, Scorecard
+from .tasks import ALL_TASKS, ROBUSTNESS_CHECKS, SUITES
+from .tasks.spec import Task, TaskContext
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 PYTEST_TIMEOUT = 900
@@ -73,7 +79,7 @@ def run_requirements(scorecard: Scorecard, repo: Path = REPO_ROOT) -> None:
                 CheckResult(
                     name="requirements/pytest",
                     category="requirements",
-                    passed=False,
+                    score=0.0,
                     detail=f"pytest did not finish within {PYTEST_TIMEOUT}s",
                     duration_ms=(time.perf_counter() - started) * 1000,
                 )
@@ -84,7 +90,7 @@ def run_requirements(scorecard: Scorecard, repo: Path = REPO_ROOT) -> None:
                 CheckResult(
                     name="requirements/pytest",
                     category="requirements",
-                    passed=False,
+                    score=0.0,
                     detail=f"pytest is not installed: {exc}",
                 )
             )
@@ -95,7 +101,7 @@ def run_requirements(scorecard: Scorecard, repo: Path = REPO_ROOT) -> None:
                 CheckResult(
                     name="requirements/pytest",
                     category="requirements",
-                    passed=False,
+                    score=0.0,
                     detail=(process.stdout + process.stderr)[-4000:],
                     duration_ms=(time.perf_counter() - started) * 1000,
                 )
@@ -113,8 +119,10 @@ def run_requirements(scorecard: Scorecard, repo: Path = REPO_ROOT) -> None:
                 CheckResult(
                     name=f"requirements/{name}",
                     category="requirements",
-                    passed=problem is None,
-                    detail="" if problem is None else (problem.get("message", "") + "\n" + (problem.text or ""))[:2000],
+                    score=1.0 if problem is None else 0.0,
+                    detail=""
+                    if problem is None
+                    else (problem.get("message", "") + "\n" + (problem.text or ""))[:2000],
                     duration_ms=float(case.get("time") or 0) * 1000,
                     weight=0.0 if skipped else 1.0,
                     requirement_ids=_requirement_ids_from_name(str(case.get("name"))),
@@ -123,18 +131,31 @@ def run_requirements(scorecard: Scorecard, repo: Path = REPO_ROOT) -> None:
 
 
 def _requirement_ids_from_name(test_name: str) -> list[str]:
-    """Extract ``R-###`` ids embedded in a parametrised test id."""
+    """Extract ``R-###`` ids embedded in a test id (``test_R_205_...``)."""
     import re
 
-    return re.findall(r"R-\d{3}", test_name)
+    return [m.replace("_", "-") for m in re.findall(r"R[_-]\d{3}", test_name)]
 
 
 # ---------------------------------------------------------------------------
-# 2. capability — end-to-end agent tasks
+# 2-5. capability suites
 # ---------------------------------------------------------------------------
 
 
-def _build_agent(task: AgentTask, root: Path, config: Config) -> Agent:
+def _build_agent(task: Task, root: Path, config: Config) -> Agent:
+    task_config = Config(
+        workspace=root,
+        provider=config.provider,
+        model=config.model,
+        base_url=config.base_url,
+        temperature=config.temperature,
+        image_backend=config.image_backend,
+        max_steps=task.budget_steps,
+        skill_paths=[root / "skills"],
+        mcp_servers=task.mcp_servers(root) if task.mcp_servers else [],
+        allow_shell=True,
+    )
+
     if config.provider == "echo":
         # Deterministic replay: measures the harness, not a model.
         provider: Any = EchoProvider(script=list(task.reference_script))
@@ -145,16 +166,7 @@ def _build_agent(task: AgentTask, root: Path, config: Config) -> Agent:
             base_url=config.base_url,
             temperature=config.temperature,
         )
-    task_config = Config(
-        workspace=root,
-        provider=config.provider,
-        model=config.model,
-        base_url=config.base_url,
-        image_backend=config.image_backend,
-        max_steps=task.budget_steps,
-        skill_paths=[root / "skills"],
-        allow_shell=True,
-    )
+
     return Agent(
         config=task_config,
         provider=provider,
@@ -163,79 +175,90 @@ def _build_agent(task: AgentTask, root: Path, config: Config) -> Agent:
     )
 
 
-async def run_capability(scorecard: Scorecard, config: Config) -> list[dict[str, Any]]:
-    """Run every capability task in a throwaway workspace. Returns timing data."""
-    timings: list[dict[str, Any]] = []
-
-    for task in CAPABILITY_TASKS:
-        workspace = Path(tempfile.mkdtemp(prefix="morph-bench-"))
-        started = time.perf_counter()
-        try:
-            task.materialise(workspace)
-            agent = _build_agent(task, workspace, config)
-            try:
-                result = await asyncio.wait_for(
-                    agent.run(task.prompt, max_steps=task.budget_steps),
-                    timeout=task.budget_seconds,
-                )
-            finally:
-                await agent.close()
-
-            if result.error:
-                outcome_passed, detail = False, f"run errored: {result.error}"
-            else:
-                outcome = task.verify(workspace, result)
-                outcome_passed, detail = outcome.passed, outcome.detail
-
-            elapsed = time.perf_counter() - started
-            timings.append(
-                {
-                    "task": task.name,
-                    "steps": result.steps,
-                    "budget_steps": task.budget_steps,
-                    "seconds": elapsed,
-                    "budget_seconds": task.budget_seconds,
-                    "passed": outcome_passed,
-                }
-            )
-        except asyncio.TimeoutError:
-            elapsed = time.perf_counter() - started
-            outcome_passed = False
-            detail = f"timed out after {task.budget_seconds:g}s"
-            timings.append(
-                {
-                    "task": task.name,
-                    "steps": task.budget_steps,
-                    "budget_steps": task.budget_steps,
-                    "seconds": elapsed,
-                    "budget_seconds": task.budget_seconds,
-                    "passed": False,
-                }
-            )
-        except Exception as exc:  # noqa: BLE001 - a broken task must not stop the benchmark
-            elapsed = time.perf_counter() - started
-            outcome_passed = False
-            detail = f"{type(exc).__name__}: {exc}"
-        finally:
-            shutil.rmtree(workspace, ignore_errors=True)
-
-        scorecard.add(
+async def run_task(task: Task, config: Config) -> tuple[CheckResult, dict[str, Any]]:
+    """Run one capability task in a throwaway workspace and grade it."""
+    # In echo mode a task with no reference trace has nothing to replay. Skip it
+    # rather than score it zero — a plumbing check must not masquerade as a
+    # capability measurement.
+    if config.provider == "echo" and not task.reference_script:
+        return (
             CheckResult(
-                name=task.name,
-                category="capability",
-                passed=outcome_passed,
-                detail=detail,
-                duration_ms=elapsed * 1000,
+                name=task.label,
+                category=task.category,
+                score=0.0,
+                detail="skipped: no reference trace for the deterministic provider",
                 weight=task.weight,
+                tier=int(task.tier),
                 requirement_ids=task.requirement_ids,
-            )
+                skipped=True,
+            ),
+            {},
         )
 
+    workspace = Path(tempfile.mkdtemp(prefix="morph-bench-"))
+    started = time.perf_counter()
+    agent: Agent | None = None
+    try:
+        task.materialise(workspace)
+        agent = _build_agent(task, workspace, config)
+        result = await asyncio.wait_for(
+            agent.run(task.prompt, max_steps=task.budget_steps), timeout=task.budget_seconds
+        )
+
+        if result.error:
+            score, detail = 0.0, f"run errored: {result.error}"
+            steps = result.steps
+        else:
+            grade = task.rubric.grade(TaskContext(root=workspace, result=result))
+            score, detail = grade.score, grade.detail
+            steps = result.steps
+
+    except asyncio.TimeoutError:
+        score, detail, steps = 0.0, f"timed out after {task.budget_seconds:g}s", task.budget_steps
+    except Exception as exc:  # noqa: BLE001 - a broken task must not stop the benchmark
+        score, detail, steps = 0.0, f"harness error: {type(exc).__name__}: {exc}", 0
+    finally:
+        if agent is not None:
+            await agent.close()
+        shutil.rmtree(workspace, ignore_errors=True)
+
+    elapsed = time.perf_counter() - started
+    check = CheckResult(
+        name=task.label,
+        category=task.category,
+        score=score,
+        detail=detail,
+        duration_ms=elapsed * 1000,
+        weight=task.weight,
+        tier=int(task.tier),
+        requirement_ids=task.requirement_ids,
+    )
+    timing = {
+        "task": task.label,
+        "steps": steps,
+        "budget_steps": task.budget_steps,
+        "seconds": elapsed,
+        "budget_seconds": task.budget_seconds,
+        "score": score,
+    }
+    return check, timing
+
+
+async def run_capability_suites(
+    scorecard: Scorecard, config: Config, only: str | None = None
+) -> list[dict[str, Any]]:
+    timings: list[dict[str, Any]] = []
+    tasks = ALL_TASKS if only is None else SUITES.get(only, [])
+    for task in tasks:
+        check, timing = await run_task(task, config)
+        scorecard.add(check)
+        if timing:
+            timings.append(timing)
     return timings
 
 
 # ---------------------------------------------------------------------------
-# 3. robustness
+# 6. robustness
 # ---------------------------------------------------------------------------
 
 
@@ -254,7 +277,7 @@ async def run_robustness(scorecard: Scorecard) -> None:
             shutil.rmtree(workspace, ignore_errors=True)
 
         scorecard.add(
-            CheckResult(
+            CheckResult.binary(
                 name=check.name,
                 category="robustness",
                 passed=passed,
@@ -267,60 +290,56 @@ async def run_robustness(scorecard: Scorecard) -> None:
 
 
 # ---------------------------------------------------------------------------
-# 4. efficiency
+# 7. efficiency
 # ---------------------------------------------------------------------------
 
 
 def run_efficiency(scorecard: Scorecard, timings: list[dict[str, Any]]) -> None:
-    """Reward solving tasks in fewer steps and less wall time."""
-    if not timings:
+    """Reward solving tasks in fewer steps and less wall time.
+
+    Graded, so shaving two steps off shows up. Only solved tasks count —
+    otherwise failing fast would score as efficiency.
+    """
+    solved = [t for t in timings if t["score"] >= 0.8]
+    if not solved:
         scorecard.add(
             CheckResult(
-                name="efficiency/no-data",
+                name="efficiency/step-budget",
                 category="efficiency",
-                passed=False,
-                detail="no capability timings were collected",
+                score=0.0,
+                detail="no task was solved, so efficiency cannot be earned",
+                weight=2.0,
             )
         )
         return
 
-    solved = [t for t in timings if t["passed"]]
-    if solved:
-        step_ratio = sum(t["steps"] / max(t["budget_steps"], 1) for t in solved) / len(solved)
-        scorecard.add(
-            CheckResult(
-                name="efficiency/step-budget",
-                category="efficiency",
-                passed=step_ratio <= 0.75,
-                detail=f"solved tasks used {step_ratio:.0%} of their step budget on average",
-                weight=2.0,
-                requirement_ids=["R-108"],
-            )
+    step_ratio = sum(t["steps"] / max(t["budget_steps"], 1) for t in solved) / len(solved)
+    scorecard.add(
+        CheckResult(
+            name="efficiency/step-budget",
+            category="efficiency",
+            score=max(0.0, min(1.0, (1.0 - step_ratio) / 0.5)),
+            detail=f"solved tasks used {step_ratio:.0%} of their step budget on average "
+            f"(full marks at 50% or below)",
+            weight=2.0,
+            requirement_ids=["R-108"],
         )
-        time_ratio = sum(t["seconds"] / max(t["budget_seconds"], 1) for t in solved) / len(solved)
-        scorecard.add(
-            CheckResult(
-                name="efficiency/time-budget",
-                category="efficiency",
-                passed=time_ratio <= 0.5,
-                detail=f"solved tasks used {time_ratio:.0%} of their time budget on average",
-                requirement_ids=["R-108"],
-            )
+    )
+
+    time_ratio = sum(t["seconds"] / max(t["budget_seconds"], 1) for t in solved) / len(solved)
+    scorecard.add(
+        CheckResult(
+            name="efficiency/time-budget",
+            category="efficiency",
+            score=max(0.0, min(1.0, (1.0 - time_ratio) / 0.7)),
+            detail=f"solved tasks used {time_ratio:.0%} of their time budget on average",
+            requirement_ids=["R-108"],
         )
-    else:
-        scorecard.add(
-            CheckResult(
-                name="efficiency/step-budget",
-                category="efficiency",
-                passed=False,
-                detail="no capability task was solved, so efficiency cannot be earned",
-                weight=2.0,
-            )
-        )
+    )
 
     timeouts = [t for t in timings if t["seconds"] >= t["budget_seconds"]]
     scorecard.add(
-        CheckResult(
+        CheckResult.binary(
             name="efficiency/no-timeouts",
             category="efficiency",
             passed=not timeouts,
@@ -331,7 +350,7 @@ def run_efficiency(scorecard: Scorecard, timings: list[dict[str, Any]]) -> None:
 
 
 # ---------------------------------------------------------------------------
-# 5. health
+# 8. health
 # ---------------------------------------------------------------------------
 
 PUBLIC_PACKAGES = ("morph", "bench", "selfimprove")
@@ -345,7 +364,6 @@ def run_health(scorecard: Scorecard, repo: Path = REPO_ROOT) -> None:
         if "__pycache__" not in path.parts
     )
 
-    # -- every module parses ------------------------------------------
     broken: list[str] = []
     trees: dict[Path, ast.Module] = {}
     for path in modules:
@@ -354,7 +372,7 @@ def run_health(scorecard: Scorecard, repo: Path = REPO_ROOT) -> None:
         except (SyntaxError, UnicodeDecodeError) as exc:
             broken.append(f"{path.relative_to(repo)}: {exc}")
     scorecard.add(
-        CheckResult(
+        CheckResult.binary(
             name="health/parses",
             category="health",
             passed=not broken,
@@ -364,7 +382,6 @@ def run_health(scorecard: Scorecard, repo: Path = REPO_ROOT) -> None:
         )
     )
 
-    # -- the package imports cleanly ----------------------------------
     probe = subprocess.run(
         [sys.executable, "-c", "import morph, bench.runner, selfimprove.loop"],
         cwd=repo,
@@ -373,7 +390,7 @@ def run_health(scorecard: Scorecard, repo: Path = REPO_ROOT) -> None:
         timeout=120,
     )
     scorecard.add(
-        CheckResult(
+        CheckResult.binary(
             name="health/imports",
             category="health",
             passed=probe.returncode == 0,
@@ -383,7 +400,6 @@ def run_health(scorecard: Scorecard, repo: Path = REPO_ROOT) -> None:
         )
     )
 
-    # -- public functions are annotated -------------------------------
     unannotated: list[str] = []
     total = 0
     for path, tree in trees.items():
@@ -405,14 +421,14 @@ def run_health(scorecard: Scorecard, repo: Path = REPO_ROOT) -> None:
         CheckResult(
             name="health/type-hints",
             category="health",
-            passed=ratio >= 0.9,
+            # Graded: going from 70% to 85% annotated should register.
+            score=max(0.0, min(1.0, (ratio - 0.5) / 0.4)),
             detail=f"{ratio:.0%} of {total} public functions fully annotated"
             + (f"; first gaps: {unannotated[:5]}" if unannotated else ""),
             requirement_ids=["R-804"],
         )
     )
 
-    # -- no silently swallowed exceptions -----------------------------
     swallowed: list[str] = []
     for path, tree in trees.items():
         for node in ast.walk(tree):
@@ -422,7 +438,7 @@ def run_health(scorecard: Scorecard, repo: Path = REPO_ROOT) -> None:
                 if only_pass and node.type is None:
                     swallowed.append(f"{path.relative_to(repo)}:{node.lineno}")
     scorecard.add(
-        CheckResult(
+        CheckResult.binary(
             name="health/no-bare-swallow",
             category="health",
             passed=not swallowed,
@@ -438,6 +454,7 @@ async def run_benchmark(
     config: Config | None = None,
     repo: Path = REPO_ROOT,
     skip_requirements: bool = False,
+    only: str | None = None,
 ) -> Scorecard:
     """Run every category and return the scorecard."""
     cfg = config or Config(workspace=repo, provider="echo", image_backend="stub")
@@ -448,9 +465,11 @@ async def run_benchmark(
             "image_backend": cfg.image_backend,
             "python": sys.version.split()[0],
             "repo": str(repo),
+            "suites": list(CAPABILITY_CATEGORIES) if only is None else [only],
             "note": (
-                "provider=echo: capability replays reference traces, so the score "
-                "measures harness integrity rather than model skill"
+                "provider=echo: capability tasks replay reference traces where one "
+                "exists and are skipped where none does. This measures harness "
+                "integrity, not model skill — run with a real model for a real score."
                 if cfg.provider == "echo"
                 else f"capability measured against {cfg.provider}/{cfg.model}"
             ),
@@ -459,8 +478,9 @@ async def run_benchmark(
 
     if not skip_requirements:
         run_requirements(scorecard, repo)
-    timings = await run_capability(scorecard, cfg)
-    await run_robustness(scorecard)
+    timings = await run_capability_suites(scorecard, cfg, only=only)
+    if only is None:
+        await run_robustness(scorecard)
     run_efficiency(scorecard, timings)
     run_health(scorecard, repo)
     return scorecard
@@ -471,7 +491,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--output", help="Write the scorecard JSON here")
     parser.add_argument("--provider", default="echo", help="echo | ollama | google")
     parser.add_argument("--model", default="gemma3:12b")
+    parser.add_argument("--base-url")
     parser.add_argument("--image-backend", default="stub")
+    parser.add_argument(
+        "--only",
+        choices=sorted(SUITES),
+        help="Run a single capability suite (skips requirements and robustness)",
+    )
     parser.add_argument(
         "--skip-requirements",
         action="store_true",
@@ -484,10 +510,15 @@ def main(argv: list[str] | None = None) -> int:
         workspace=REPO_ROOT,
         provider=args.provider,
         model=args.model,
+        base_url=args.base_url,
         image_backend=args.image_backend,
     )
     scorecard = asyncio.run(
-        run_benchmark(config, skip_requirements=args.skip_requirements)
+        run_benchmark(
+            config,
+            skip_requirements=args.skip_requirements or args.only is not None,
+            only=args.only,
+        )
     )
 
     if not args.quiet:

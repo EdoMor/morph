@@ -714,24 +714,278 @@ def test_R_706_loop_runs_unattended_in_ci(repo_root):
 
 
 def test_R_707_goalposts_are_protected(repo_root):
-    """R-707: the loop cannot edit the requirements, the gate, or the scorer."""
-    from selfimprove.guard import PROTECTED, is_protected, violations
+    """R-707: the loop cannot edit the requirements, the gate, the scorer or the tasks."""
+    from selfimprove.guard import PROTECTED, is_protected
 
-    assert "REQUIREMENTS.md" in PROTECTED
-    assert "tests/test_requirements.py" in PROTECTED
-    assert "bench/scorecard.py" in PROTECTED
+    for required in (
+        "REQUIREMENTS.md",
+        "tests/test_requirements.py",
+        "bench/scorecard.py",
+        "bench/tasks",
+    ):
+        assert required in PROTECTED
 
     assert is_protected("REQUIREMENTS.md")
     assert is_protected("./tests/test_requirements.py")
     assert is_protected("bench/scorecard.py")
+    # The whole task package, so the loop cannot author its own easy benchmark.
+    assert is_protected("bench/tasks/coding.py")
+    assert is_protected("bench/tasks/spec.py")
     assert not is_protected("morph/agent.py")
     assert not is_protected("tests/test_agent.py")
-
-    assert violations(repo_root, "HEAD") == [] or True  # callable against a real repo
+    assert not is_protected("bench/runner.py")
 
     for path in PROTECTED:
-        if path.endswith(".py") or path.endswith(".md"):
-            assert (repo_root / path).exists(), f"protected path {path} does not exist"
+        assert (repo_root / path).exists(), f"protected path {path} does not exist"
+
+
+# ---------------------------------------------------------------------------
+# Benchmark calibration — the instrument itself
+# ---------------------------------------------------------------------------
+
+
+def test_R_708_every_suite_spans_the_difficulty_range():
+    """R-708: no gradient, no learning signal."""
+    from collections import Counter
+
+    from bench.scorecard import CAPABILITY_CATEGORIES
+    from bench.tasks import SUITES
+
+    assert set(SUITES) == set(CAPABILITY_CATEGORIES)
+
+    for name, tasks in SUITES.items():
+        assert len(tasks) >= 5, f"{name} has only {len(tasks)} tasks"
+        tiers = Counter(int(t.tier) for t in tasks)
+        missing = sorted({1, 2, 3, 4, 5} - set(tiers))
+        assert not missing, f"{name} has no tasks at tier(s) {missing}"
+        biggest = max(tiers.values())
+        assert biggest <= len(tasks) / 2 + 1, (
+            f"{name} is lopsided: {biggest} of {len(tasks)} tasks at one tier"
+        )
+        assert all(t.category == name for t in tasks)
+
+
+def test_R_708_harder_tiers_are_worth_more():
+    from bench.tasks.spec import TIER_WEIGHT, Tier
+
+    weights = [TIER_WEIGHT[t] for t in sorted(Tier)]
+    assert weights == sorted(weights), "tier weights must be non-decreasing"
+    assert weights[-1] > weights[0]
+    # Sub-exponential: solving every easy task must still be worth something.
+    assert weights[-1] / weights[0] <= 12
+
+
+def test_R_709_rubrics_are_graded_not_binary():
+    """R-709: partial progress has to be visible, or the loop cannot climb."""
+    from bench.tasks.spec import Criterion, Rubric, TaskContext
+
+    rubric = Rubric(
+        [
+            Criterion("a", 1.0, lambda c: True),
+            Criterion("b", 1.0, lambda c: False),
+            Criterion("c", 2.0, lambda c: 0.5),
+        ]
+    )
+    grade = rubric.grade(TaskContext(root=REPO_ROOT, result=None))
+
+    assert 0.0 < grade.score < 1.0
+    assert grade.score == pytest.approx((1.0 + 0.0 + 1.0) / 4.0)
+    assert grade.breakdown["c"] == 0.5
+    assert not grade.solved
+
+
+def test_R_709_a_critical_failure_zeroes_the_task():
+    """A destructive answer must never out-score a partial one."""
+    from bench.tasks.spec import Criterion, Rubric, TaskContext
+
+    ctx = TaskContext(root=REPO_ROOT, result=None)
+    partial = Rubric([Criterion("ok", 1.0, lambda c: 0.4), Criterion("intact", 1.0, lambda c: True, critical=True)])
+    destructive = Rubric([Criterion("ok", 1.0, lambda c: 1.0), Criterion("intact", 1.0, lambda c: False, critical=True)])
+
+    assert destructive.grade(ctx).score == 0.0
+    assert partial.grade(ctx).score > destructive.grade(ctx).score
+
+
+def test_R_709_a_criterion_that_raises_scores_zero_not_crashes():
+    from bench.tasks.spec import Criterion, Rubric, TaskContext
+
+    def explode(_ctx):
+        raise RuntimeError("boom")
+
+    grade = Rubric([Criterion("boom", 1.0, explode), Criterion("fine", 1.0, lambda c: True)]).grade(
+        TaskContext(root=REPO_ROOT, result=None)
+    )
+    assert grade.score == pytest.approx(0.5)
+    assert "boom" in grade.detail
+
+
+def test_R_709_critical_criteria_gate_but_do_not_score():
+    """Doing nothing satisfies most "don't break it" criteria — they must not pay."""
+    from bench.tasks.spec import Criterion, Rubric, TaskContext
+
+    ctx = TaskContext(root=REPO_ROOT, result=None)
+    # An agent that changed nothing: the gate passes, the real work does not.
+    did_nothing = Rubric(
+        [
+            Criterion("intact", 5.0, lambda c: True, critical=True),
+            Criterion("the actual task", 1.0, lambda c: False),
+        ]
+    )
+    assert did_nothing.grade(ctx).score == 0.0, "a no-op run must not earn a free floor"
+
+    all_gates = Rubric([Criterion("intact", 1.0, lambda c: True, critical=True)])
+    assert all_gates.grade(ctx).score == 1.0
+
+
+async def test_R_709_benchmark_discriminates_between_competence_levels():
+    """R-708/R-709 together: the score must move with competence.
+
+    A benchmark whose tasks are all solved, or all failed, gives the loop nothing
+    to climb. This drives real tasks with progressively truncated reference
+    traces — a stand-in for models of increasing competence — and asserts the
+    scores actually spread out.
+    """
+    import statistics
+
+    import bench.runner as runner
+    from bench.tasks import ALL_TASKS
+    from morph.config import Config
+
+    sample = [t for t in ALL_TASKS if t.reference_script and len(t.reference_script) >= 3][:8]
+    assert len(sample) >= 6, "not enough multi-step tasks to measure a gradient"
+
+    config = Config(workspace=REPO_ROOT, provider="echo", image_backend="stub")
+    original_build = runner._build_agent
+
+    def truncated(fraction: float):
+        def build(task, root, cfg):
+            agent = original_build(task, root, cfg)
+            script = list(task.reference_script)
+            keep = max(0, int(len(script) * fraction))
+            agent.provider = EchoProvider(
+                script=script[:keep] + [EchoProvider.text_response("I think that's done.")]
+            )
+            return agent
+
+        return build
+
+    means: list[float] = []
+    all_scores: list[float] = []
+    try:
+        for fraction in (0.0, 0.5, 1.0):
+            runner._build_agent = truncated(fraction)
+            scores = [(await runner.run_task(t, config))[0].score for t in sample]
+            means.append(statistics.mean(scores))
+            all_scores.extend(scores)
+    finally:
+        runner._build_agent = original_build
+
+    assert means == sorted(means), f"score must rise with competence, got {means}"
+    assert means[0] < 0.35, f"an incompetent run scores too well ({means[0]:.2f}) — free credit"
+    assert means[-1] > 0.9, f"a correct run must score near full marks, got {means[-1]:.2f}"
+    assert means[-1] - means[0] > 0.5, "the benchmark barely separates competence levels"
+
+    partial = [s for s in all_scores if 0.0 < s < 1.0]
+    assert partial, "no task ever scored partially — the rubrics are effectively binary"
+
+
+def test_R_710_frontier_and_nearest_misses():
+    """R-710: the loop is pointed at the closest failure, not the hardest."""
+    from bench.scorecard import CheckResult, Scorecard
+
+    card = Scorecard()
+    for tier, score in ((1, 1.0), (2, 1.0), (3, 0.7), (4, 0.1), (5, 0.0)):
+        card.add(CheckResult(f"coding/T{tier}/x", "coding", score=score, tier=tier))
+
+    assert card.tier_profile("coding") == {1: 1.0, 2: 1.0, 3: 0.7, 4: 0.1, 5: 0.0}
+    assert card.frontier("coding") == 3
+
+    targets = card.next_targets()
+    assert [t.tier for t in targets] == [3, 4, 5], "nearest misses must be easiest-first"
+    assert card.headroom("coding") > 0
+
+
+def test_R_710_frontier_is_zero_when_the_basics_fail():
+    from bench.scorecard import CheckResult, Scorecard
+
+    card = Scorecard()
+    card.add(CheckResult("coding/T1/x", "coding", score=0.2, tier=1))
+    card.add(CheckResult("coding/T2/x", "coding", score=0.9, tier=2))
+    # A fluke at T2 does not count while T1 is broken.
+    assert card.frontier("coding") == 0
+
+
+def test_R_711_benchmark_diagnoses_its_own_calibration():
+    """R-711: a suite with no gradient is a broken instrument and must say so."""
+    from bench.scorecard import CheckResult, Scorecard
+
+    def card_with(scores: list[float], skipped: int = 0) -> Scorecard:
+        card = Scorecard()
+        for index, score in enumerate(scores):
+            card.add(CheckResult(f"coding/x{index}", "coding", score=score, tier=index % 5 + 1))
+        for index in range(skipped):
+            card.add(CheckResult(f"coding/s{index}", "coding", score=0.0, tier=1, skipped=True))
+        return card
+
+    assert card_with([1.0, 1.0, 1.0]).calibration("coding") == "saturated"
+    assert card_with([0.0, 0.0, 0.05]).calibration("coding") == "floored"
+    assert card_with([1.0, 0.5, 0.0]).calibration("coding") == "healthy"
+    assert card_with([1.0, 1.0], skipped=2).calibration("coding") == "partial"
+    assert Scorecard().calibration("coding") == "empty"
+
+    warnings = card_with([1.0, 1.0, 1.0]).instrument_warnings
+    assert any("saturated" in w and "Add harder tasks" in w for w in warnings)
+    assert any("floored" in w for w in card_with([0.0, 0.0]).instrument_warnings)
+
+    # Diagnostics must reach the serialised scorecard the loop reads.
+    payload = card_with([1.0, 0.5, 0.0]).to_dict()
+    assert payload["diagnostics"]["coding"]["calibration"] == "healthy"
+    assert "frontier" in payload["diagnostics"]["coding"]
+    assert payload["next_targets"]
+
+
+def test_R_711_loop_prompt_leads_with_frontier_and_nearest_misses():
+    from selfimprove.loop import _feedback_from
+
+    feedback = _feedback_from(
+        {
+            "composite": 42.0,
+            "gated": False,
+            "diagnostics": {
+                "coding": {"frontier": 2, "headroom": 8.0, "calibration": "healthy", "tier_profile": {"1": 1.0, "3": 0.3}}
+            },
+            "next_targets": [
+                {"name": "coding/T3/refactor", "score": 0.55, "tier": 3, "detail": "duplication remains"}
+            ],
+            "results": [],
+            "instrument_warnings": ["coding: saturated"],
+        }
+    )
+    assert "frontier T2" in feedback
+    assert "Nearest misses" in feedback
+    assert "coding/T3/refactor" in feedback
+    assert "duplication remains" in feedback
+    assert "do not try to fix them yourself" in feedback
+
+
+def test_R_712_unrunnable_checks_are_skipped_not_failed():
+    """R-712: a replay of reference traces must not pose as a measurement."""
+    from bench.scorecard import CheckResult, Scorecard
+
+    card = Scorecard()
+    card.add(CheckResult("coding/T1/a", "coding", score=1.0, tier=1))
+    card.add(CheckResult("coding/T5/b", "coding", score=0.0, tier=5, skipped=True))
+
+    assert card.category_score("coding") == 1.0, "a skipped check must not drag the score down"
+    assert card.by_category("coding") == [card.results[0]]
+    assert card.failures == []
+    assert len(card.skipped_in("coding")) == 1
+
+    # And the runner must actually mark them, rather than scoring them zero.
+    from bench.tasks import ALL_TASKS
+
+    unscripted = [t for t in ALL_TASKS if not t.reference_script]
+    assert unscripted, "some tasks should be model-only, or echo mode proves too much"
 
 
 # ---------------------------------------------------------------------------

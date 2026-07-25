@@ -117,11 +117,30 @@ jobs:
         id: base
         run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
+      # The dashboard cannot wait for Pages to redeploy — by then the run it
+      # would be showing is over. This pushes the agent's event stream to the
+      # `live` branch every few seconds, where raw.githubusercontent.com serves
+      # it to the page directly (R-721). It touches no working tree and no
+      # branch but `live`; see scripts/publish_live.py.
+      - name: Start the live trace publisher
+        run: |
+          nohup python scripts/publish_live.py --every 15 > /tmp/live-publish.log 2>&1 &
+          echo "$!" > /tmp/live-publish.pid
+
       - name: Evolve
         run: |
           ARGS=(--iterations "${ITERATIONS}" --provider "${MORPH_PROVIDER}" --model "${MORPH_MODEL}")
           if [ -n "${FOCUS}" ]; then ARGS+=(--focus "${FOCUS}"); fi
           python -m selfimprove.loop "${ARGS[@]}" | tee loop-output.json || true
+
+      # Stop it before the publish steps, then send the final state once more so
+      # the page's last frame matches how the run actually ended.
+      - name: Stop the live trace publisher
+        if: always()
+        run: |
+          kill "$(cat /tmp/live-publish.pid)" 2>/dev/null || true
+          python scripts/publish_live.py --once || true
+          tail -20 /tmp/live-publish.log || true
 
       - name: What changed
         id: changed

@@ -2,7 +2,11 @@ name: ci
 
 on:
   push:
-    branches: ["**"]
+    # Everything except the telemetry branch, which a running self-improve job
+    # rewrites every fifteen seconds — that would be four CI runs a minute, on a
+    # branch containing no code. A GITHUB_TOKEN push does not start a workflow
+    # anyway, but this must not depend on remembering that.
+    branches-ignore: [live]
   pull_request:
 
 concurrency:

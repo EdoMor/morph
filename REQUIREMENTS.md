@@ -222,6 +222,26 @@ user controls — including a phone.
   - all of this goes to **stderr**, because stdout carries the JSON that CI
     pipes into a file, and a trace line in the middle of it would corrupt it;
   - the dashboard shows when a run is in flight and links to its live log.
+- **R-721** — The **agent's own trace is visible on the dashboard while the run
+  is still going**: the model's reasoning, each tool call with its arguments,
+  each result and whether it succeeded, and the iteration boundaries between
+  them. A link to a CI log is not this — it requires a GitHub account, and it
+  buries the six lines that matter under installer output.
+
+  The mechanism must not depend on a deploy: GitHub Pages redeploys when a
+  workflow *finishes*, which is exactly when live ceases to be live. So the run
+  pushes its event stream to a dedicated branch every few seconds, and the
+  static page fetches it from `raw.githubusercontent.com` — public, CORS-
+  enabled, no token. That branch carries telemetry only, is rewritten from a
+  parentless commit each time so it never accumulates history, and can never be
+  the publish branch. The publisher writes through git plumbing against a
+  temporary index, so it cannot disturb the working tree the loop is
+  concurrently committing and rebasing in, and any failure to publish is logged
+  and skipped — a run must never fail because nobody was watching.
+
+  The trace file is bounded, so a long run cannot grow into a download the page
+  chokes on, and the page distinguishes a live run from a finished one by
+  whether the heartbeat is still moving.
 - **R-717** — Progress is **public and legible without reading the repository**.
   A GitHub Pages dashboard shows the current score, its category and difficulty
   breakdown, the score over time, the available releases, and **every attempt —

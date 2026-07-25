@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import subprocess
 import time
@@ -132,15 +133,30 @@ def summarise(history: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def repo_url(repo: Path) -> str:
+    """The canonical ``https://github.com/owner/name`` for this checkout.
+
+    The page derives both its links and the live-trace endpoint from this, so a
+    remote that is an SSH URL, or a proxy, or missing entirely must not silently
+    turn the live view off. ``GITHUB_REPOSITORY`` is set in every Actions run and
+    is the authority when present.
+    """
+    slug = os.environ.get("GITHUB_REPOSITORY", "").strip("/")
+    if slug.count("/") == 1:
+        return f"https://github.com/{slug}"
+
+    remote = _git(repo, "config", "--get", "remote.origin.url").removesuffix(".git")
+    match = re.search(r"github\.com[:/]+([^/]+/[^/]+)", remote)
+    return f"https://github.com/{match.group(1)}" if match else remote
+
+
 def build(repo: Path = REPO_ROOT) -> dict[str, Any]:
     history = read_history(repo)
     scorecard = read_scorecard(repo)
 
     return {
         "generated_at": time.time(),
-        "repo": _git(repo, "config", "--get", "remote.origin.url")
-        .removesuffix(".git")
-        .replace("git@github.com:", "https://github.com/"),
+        "repo": repo_url(repo),
         "commit": _git(repo, "rev-parse", "--short", "HEAD"),
         "version": current_version(repo),
         "scorecard": {

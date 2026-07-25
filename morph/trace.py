@@ -27,6 +27,14 @@ MAX_ARG_CHARS = 150
 MAX_RESULT_CHARS = 320
 MAX_TEXT_CHARS = 600
 
+#: The live log is read on a screen rather than scanned in a terminal, so it can
+#: afford whole paragraphs — the model's reasoning is the most interesting thing
+#: in the stream and truncating it to one line hides why it did what it did.
+LIVE_TEXT_CHARS = 1600
+LIVE_RESULT_CHARS = 800
+#: Bounded so an eight-hour run cannot grow a file the page has to download.
+LIVE_MAX_EVENTS = 400
+
 
 def _elapsed(seconds: float) -> str:
     if seconds < 60:
@@ -107,6 +115,80 @@ class TraceRenderer:
 
 
 @dataclass
+class EventLog:
+    """The same event stream as :class:`TraceRenderer`, as JSONL for a reader.
+
+    One flat record per line — ``{t, kind, text, …}`` — so a page can render it
+    without knowing anything about Morph's internals. Rewritten whole on every
+    append rather than appended to: it keeps the file bounded, and a reader that
+    polls mid-write gets the previous complete version instead of half a line.
+    """
+
+    path: Path
+    limit: int = LIVE_MAX_EVENTS
+    records: list[dict[str, Any]] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        self.path = Path(self.path)
+
+    def append(self, kind: str, text: str = "", **fields: Any) -> None:
+        self.records.append({"t": round(time.time(), 3), "kind": kind, "text": text, **fields})
+        del self.records[: max(0, len(self.records) - self.limit)]
+        self._flush()
+
+    def _flush(self) -> None:
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            body = "\n".join(json.dumps(r, ensure_ascii=False, default=str) for r in self.records)
+            temporary = self.path.with_suffix(".tmp")
+            temporary.write_text(body + "\n", "utf-8")
+            temporary.replace(self.path)
+        except OSError:
+            pass  # a log of the work must never be able to stop the work
+
+    def observe(self, event: Any) -> None:
+        """Record one :class:`morph.agent.AgentEvent`."""
+        kind = getattr(event, "type", None) or event.get("type")
+        data = getattr(event, "data", None) or event
+
+        if kind == "tool_use":
+            self.append(
+                "tool_use",
+                _preview_args(data.get("arguments")),
+                step=data.get("step"),
+                name=data.get("name"),
+            )
+        elif kind == "tool_result":
+            self.append(
+                "tool_result",
+                _squash(data.get("content", ""), LIVE_RESULT_CHARS),
+                step=data.get("step"),
+                name=data.get("name"),
+                ok=bool(data.get("ok")),
+                ms=round(data.get("duration_ms", 0)),
+            )
+        elif kind == "text":
+            text = _squash(data.get("text", ""), LIVE_TEXT_CHARS)
+            if text:
+                self.append("text", text, step=data.get("step"))
+        elif kind == "error":
+            self.append(
+                "error",
+                _squash(data.get("message", ""), LIVE_RESULT_CHARS),
+                step=data.get("step"),
+                recoverable=bool(data.get("recoverable")),
+            )
+        elif kind == "done":
+            result = data.get("result") or {}
+            self.append(
+                "done",
+                f"{result.get('stop_reason')} after {result.get('steps')} step(s), "
+                f"{len(result.get('tool_calls') or [])} tool call(s)",
+                steps=result.get("steps"),
+            )
+
+
+@dataclass
 class ProgressFile:
     """A heartbeat anything can poll: CI, a dashboard, or a human with `cat`.
 
@@ -117,6 +199,9 @@ class ProgressFile:
     path: Path
     state: dict[str, Any] = field(default_factory=dict)
     started: float = field(default_factory=time.time)
+    #: Optional event log fed from the same calls, so the loop wires the live
+    #: view up once rather than passing two objects through every function.
+    events: "EventLog | None" = None
 
     def __post_init__(self) -> None:
         self.path = Path(self.path)
@@ -124,6 +209,16 @@ class ProgressFile:
         self.state.setdefault("started_at", self.started)
 
     def update(self, **fields: Any) -> None:
+        # A phase change is the structure of the run — mark it in the log so the
+        # stream reads as "iteration 2 … then these steps", not one flat list.
+        phase = fields.get("phase")
+        if self.events is not None and phase is not None and phase != self.state.get("phase"):
+            self.events.append(
+                "phase",
+                str(fields.get("activity") or phase),
+                phase=phase,
+                iteration=fields.get("iteration", self.state.get("iteration")),
+            )
         self.state.update(fields)
         self.state["updated_at"] = time.time()
         self.state["elapsed_s"] = round(time.time() - self.started, 1)
@@ -139,6 +234,9 @@ class ProgressFile:
     def observe(self, event: Any) -> None:
         kind = getattr(event, "type", None) or event.get("type")
         data = getattr(event, "data", None) or event
+
+        if self.events is not None:
+            self.events.observe(event)
 
         if kind == "tool_use":
             self.update(

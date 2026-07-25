@@ -27,7 +27,7 @@ from bench.scorecard import compare
 from morph.agent import Agent
 from morph.config import Config
 from morph.llm import get_provider
-from morph.trace import ProgressFile, TraceRenderer
+from morph.trace import EventLog, ProgressFile, TraceRenderer
 
 from .guard import violations
 from .prompts import SYSTEM_PROMPT, append_history, build_improvement_prompt, load_history
@@ -463,8 +463,13 @@ async def run_loop(
     if git(repo, "rev-parse", "--is-inside-work-tree", check=False) != "true":
         raise GitError(f"{repo} is not a git repository; the loop needs git for isolation")
 
-    progress = ProgressFile(Path(history_path).parent / "progress.json"
-                            if history_path else PROGRESS_PATH)
+    progress_path = Path(history_path).parent / "progress.json" if history_path else PROGRESS_PATH
+    progress = ProgressFile(
+        progress_path,
+        # The same stream the console trace renders, kept as JSONL so the
+        # dashboard can show the run as it happens rather than after it (R-721).
+        events=EventLog(progress_path.parent / "live-trace.jsonl"),
+    )
     progress.update(phase="baseline", activity="scoring the current code", iterations=iterations)
 
     tracer = TraceRenderer()

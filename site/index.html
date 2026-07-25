@@ -40,6 +40,25 @@
     <span class="live-go">watch the live log →</span>
   </a>
 
+  <!-- ------------------------------------------------------------------ -->
+  <section class="card trace-card" id="trace-card" hidden>
+    <div class="card-head">
+      <h2>
+        <span class="pulse" aria-hidden="true"></span>
+        What it is doing right now
+      </h2>
+      <p class="hint" id="trace-status">Connecting…</p>
+    </div>
+    <div class="trace-controls">
+      <label class="toggle">
+        <input type="checkbox" id="trace-follow" checked>
+        Follow the newest step
+      </label>
+      <span class="hint" id="trace-age"></span>
+    </div>
+    <ol id="trace" class="trace" aria-live="polite"></ol>
+  </section>
+
   <div id="empty" class="card empty" hidden>
     <h2>No runs recorded yet</h2>
     <p>The loop has not yet published an iteration. Once it does, its score,

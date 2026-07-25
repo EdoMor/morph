@@ -1821,6 +1821,132 @@ def test_R_718_trace_writes_to_stderr_not_stdout():
     assert "tee loop-output.json" in workflow, "CI captures stdout, so stdout must stay clean"
 
 
+def test_R_721_event_log_captures_the_stream_a_reader_needs(tmp_path):
+    """R-721: reasoning, calls, results and boundaries, as flat renderable JSONL."""
+    from morph.agent import AgentEvent
+    from morph.trace import EventLog, ProgressFile
+
+    target = tmp_path / "live-trace.jsonl"
+    progress = ProgressFile(tmp_path / "progress.json", events=EventLog(target))
+
+    progress.update(phase="editing", iteration=2, activity="building the prompt")
+    progress.observe(AgentEvent("text", {"step": 1, "text": "Okay, the guard is in agent.py."}))
+    progress.observe(
+        AgentEvent("tool_use", {"step": 1, "name": "read_file", "arguments": {"path": "a.py"}})
+    )
+    progress.observe(
+        AgentEvent("tool_result", {"step": 1, "name": "read_file", "ok": True, "content": "x = 1"})
+    )
+    progress.observe(AgentEvent("error", {"step": 2, "message": "bad json", "recoverable": True}))
+    progress.observe(
+        AgentEvent("done", {"result": {"stop_reason": "end_turn", "steps": 2, "tool_calls": [{}]}})
+    )
+
+    records = [json.loads(line) for line in target.read_text("utf-8").splitlines() if line.strip()]
+    kinds = [r["kind"] for r in records]
+    assert kinds == ["phase", "text", "tool_use", "tool_result", "error", "done"]
+
+    assert records[0]["iteration"] == 2, "iteration boundaries must be visible"
+    assert "guard is in agent.py" in records[1]["text"], "the reasoning is the point"
+    assert records[2]["name"] == "read_file" and "a.py" in records[2]["text"]
+    assert records[3]["ok"] is True
+    assert records[4]["recoverable"] is True
+    assert all("t" in r for r in records), "every record needs a timestamp to age out"
+
+
+def test_R_721_event_log_is_bounded_and_always_whole(tmp_path):
+    """A long run must not become a download, and a poller must not catch half a write."""
+    from morph.trace import EventLog
+
+    target = tmp_path / "live-trace.jsonl"
+    log = EventLog(target, limit=25)
+    for index in range(200):
+        log.append("text", f"thought number {index}")
+
+    lines = [line for line in target.read_text("utf-8").splitlines() if line.strip()]
+    assert len(lines) == 25, "the file must stay bounded"
+    assert json.loads(lines[-1])["text"].endswith("199"), "the newest events are the kept ones"
+    # Every line parses: the file is rewritten whole, never appended mid-record.
+    assert all(json.loads(line)["kind"] == "text" for line in lines)
+
+
+def test_R_721_event_log_never_breaks_the_run(tmp_path):
+    """Telemetry that can fail a run is worse than no telemetry."""
+    from morph.trace import EventLog
+
+    blocked = tmp_path / "nope"
+    blocked.write_text("i am a file, not a directory", "utf-8")
+    EventLog(blocked / "trace.jsonl").append("text", "should not raise")
+
+
+def test_R_721_live_publisher_cannot_touch_real_branches_or_the_worktree(tmp_path):
+    """The publisher force-pushes by design, so what it may target is the safety."""
+    import subprocess
+
+    from scripts.publish_live import NEVER, PublishError, publish_once
+
+    for forbidden in ("main", "master", "gh-pages"):
+        assert forbidden in NEVER
+        with pytest.raises(PublishError):
+            publish_once(tmp_path, branch=forbidden)
+
+    # A real repository, mid-edit, with a dirty index — as during a run.
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    run = lambda *a: subprocess.run(["git", *a], cwd=repo, check=True, capture_output=True)  # noqa: E731
+    run("init", "-q", "-b", "main")
+    run("config", "user.email", "t@example.com")
+    run("config", "user.name", "t")
+    (repo / "code.py").write_text("original\n", "utf-8")
+    run("add", "-A")
+    run("commit", "-qm", "first")
+    (repo / "code.py").write_text("edited but not committed\n", "utf-8")
+    (repo / "selfimprove").mkdir()
+    (repo / "selfimprove" / "live-trace.jsonl").write_text('{"kind":"text","text":"hi"}\n', "utf-8")
+
+    before_status = subprocess.run(
+        ["git", "status", "--porcelain"], cwd=repo, capture_output=True, text=True
+    ).stdout
+    before_head = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True
+    ).stdout
+
+    # No remote configured: the push fails, and that must be all that happens.
+    with pytest.raises(PublishError):
+        publish_once(repo, branch="live")
+
+    after_status = subprocess.run(
+        ["git", "status", "--porcelain"], cwd=repo, capture_output=True, text=True
+    ).stdout
+    after_head = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True
+    ).stdout
+    assert after_status == before_status, "the loop's working tree must be untouched"
+    assert after_head == before_head, "HEAD must be untouched"
+    assert (repo / "code.py").read_text("utf-8") == "edited but not committed\n"
+
+
+def test_R_721_dashboard_reads_the_live_branch_without_a_deploy():
+    """Pages redeploys at the end of a run; the live view must not wait for that."""
+    app = (REPO_ROOT / "site" / "app.js").read_text("utf-8")
+    assert "raw.githubusercontent.com" in app, "the page must fetch the branch directly"
+    assert "/live" in app
+    assert "ts=" in app, "the raw CDN caches; the poll must bust it"
+
+    markup = (REPO_ROOT / "site" / "index.html").read_text("utf-8")
+    assert 'id="trace"' in markup and 'id="trace-card"' in markup
+
+    workflow = (REPO_ROOT / ".github" / "workflows" / "self-improve.yml").read_text("utf-8")
+    assert "publish_live.py" in workflow, "nothing publishes the trace during the run"
+    evolve = workflow.index("name: Evolve")
+    assert workflow.index("Start the live trace publisher") < evolve, "must start before the work"
+
+    # Four pushes a minute to a branch CI watches would be four CI runs a minute.
+    ci = (REPO_ROOT / ".github" / "workflows" / "ci.yml").read_text("utf-8")
+    assert "branches-ignore: [live]" in ci, "CI must not run on the telemetry branch"
+    assert 'branches: ["**"]' not in ci
+
+
 def test_R_718_progress_heartbeat_tracks_activity(tmp_path):
     """A stalled run must be distinguishable from a slow one."""
     from morph.agent import AgentEvent

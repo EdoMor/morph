@@ -249,6 +249,11 @@ function render(data) {
     `${summary.accepted ?? 0}<small> of ${summary.attempts ?? 0}</small>`;
   $("#hd-hours").innerHTML = `${summary.model_hours ?? 0}<small> h</small>`;
 
+  // Before the early return: a fork with no history yet still has a first run
+  // to watch, and that is the most interesting moment it will ever have.
+  pollLiveRun(data.repo);
+  pollLiveTrace(data.repo);
+
   if (!summary.attempts && !scorecard) {
     $("#empty").hidden = false;
     return;
@@ -276,8 +281,6 @@ function render(data) {
   $("#meta").textContent =
     `Commit ${data.commit}${model ? ` · measured against ${model}` : ""} · ` +
     `updated ${new Date(data.generated_at * 1000).toLocaleString()}.`;
-
-  pollLiveRun(data.repo);
 
   if (data.repo) {
     const links = $("#links");
@@ -333,6 +336,110 @@ async function pollLiveRun(repoUrl) {
 
   check();
   setInterval(check, 45000);
+}
+
+/* ----------------------------------------------------------- live trace */
+
+/* The run's own event stream, pushed to the `live` branch every few seconds
+ * while it happens (scripts/publish_live.py) and served from raw.github­
+ * usercontent.com, which is public and sends CORS headers. Pages itself only
+ * redeploys when a workflow ends, which is too late to watch anything.
+ *
+ * The CDN caches raw files for a few minutes; the timestamp query defeats it.
+ * If it ever does not, the log lags rather than breaks. */
+
+const TRACE_POLL_MS = 12000;
+const TRACE_STALE_S = 180;   /* no heartbeat for this long: the run is over */
+const TRACE_MAX_ROWS = 400;
+
+function traceLine(record) {
+  const row = el("li", `trace-row is-${record.kind}`);
+  const step = record.step ? `step ${record.step}` : "";
+
+  if (record.kind === "phase") {
+    row.className = "trace-row is-phase";
+    row.appendChild(el("span", "trace-what",
+      record.iteration ? `iteration ${record.iteration}` : String(record.phase || "")));
+    row.appendChild(el("span", "trace-body", record.text || ""));
+    return row;
+  }
+
+  const marks = { text: "·", tool_use: "→", tool_result: "←", error: "!", done: "⤷" };
+  row.appendChild(el("span", "trace-mark", marks[record.kind] || "·"));
+
+  const what = el("span", "trace-what");
+  if (record.kind === "tool_use") what.textContent = `${step} ${record.name}`;
+  else if (record.kind === "tool_result") what.textContent = record.ok ? "ok" : "failed";
+  else if (record.kind === "text") what.textContent = `${step} thinking`;
+  else what.textContent = step || record.kind;
+  row.appendChild(what);
+
+  const body = el("span", "trace-body");
+  if (record.kind === "tool_use") body.textContent = `(${record.text || ""})`;
+  else body.textContent = record.text || "";
+  row.appendChild(body);
+
+  if (record.kind === "tool_result" && !record.ok) row.classList.add("is-fail");
+  if (record.kind === "error" && record.recoverable) row.classList.add("is-retry");
+  return row;
+}
+
+async function pollLiveTrace(repoUrl) {
+  const match = /github\.com\/([^/]+)\/([^/]+)/.exec(repoUrl || "");
+  if (!match) return;
+  const [, owner, repo] = match;
+  const base = `https://raw.githubusercontent.com/${owner}/${repo}/live`;
+  const card = $("#trace-card");
+  const list = $("#trace");
+  let lastCount = -1;
+
+  async function grab(name) {
+    const response = await fetch(`${base}/${name}?ts=${Date.now()}`, { cache: "no-store" });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    return response.text();
+  }
+
+  async function check() {
+    let body, status = {};
+    try {
+      body = await grab("trace.jsonl");
+      try { status = JSON.parse(await grab("status.json")); } catch { /* optional */ }
+    } catch {
+      card.hidden = true;   /* no run has ever published, or the branch is gone */
+      return;
+    }
+
+    const records = body.split("\n")
+      .filter((line) => line.trim())
+      .map((line) => { try { return JSON.parse(line); } catch { return null; } })
+      .filter(Boolean)
+      .slice(-TRACE_MAX_ROWS);
+    if (!records.length) { card.hidden = true; return; }
+
+    card.hidden = false;
+    const age = (Date.now() / 1000) - (status.updated_at || records[records.length - 1].t || 0);
+    const live = age < TRACE_STALE_S;
+    card.classList.toggle("is-live", live);
+
+    $("#trace-status").textContent = live
+      ? `${status.phase || "running"} — ${status.activity || "working"}`
+      : "The last run has finished. This is how it ended.";
+    $("#trace-age").textContent = live
+      ? `updated ${Math.max(0, Math.round(age))}s ago`
+      : `ended ${when((status.updated_at || 0))}`;
+
+    if (records.length !== lastCount) {
+      lastCount = records.length;
+      list.textContent = "";
+      records.forEach((record) => list.appendChild(traceLine(record)));
+      if ($("#trace-follow").checked) {
+        list.scrollTop = list.scrollHeight;
+      }
+    }
+  }
+
+  check();
+  setInterval(check, TRACE_POLL_MS);
 }
 
 fetch("data/dashboard.json", { cache: "no-store" })

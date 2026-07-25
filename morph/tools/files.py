@@ -45,6 +45,92 @@ def _rel(root: Path, path: Path) -> str:
         return str(path)
 
 
+def _match_ignoring_indentation(haystack: str, needle: str) -> list[tuple[int, int, int]]:
+    """Find ``needle`` in ``haystack`` comparing lines with whitespace stripped.
+
+    Returns ``(start, end, shift)`` spans into ``haystack``, where ``shift`` is
+    how much further the file is indented than the caller's text — so the
+    replacement can be re-indented to match its new home.
+    """
+    lines = haystack.splitlines(keepends=True)
+    wanted = [line.strip() for line in needle.splitlines()]
+    if not wanted or not any(wanted):
+        return []
+
+    # Byte offset at which each line starts, so a line span maps back to a slice.
+    offsets, position = [], 0
+    for line in lines:
+        offsets.append(position)
+        position += len(line)
+    offsets.append(position)
+
+    spans: list[tuple[int, int, int]] = []
+    for index in range(len(lines) - len(wanted) + 1):
+        window = lines[index : index + len(wanted)]
+        if [line.strip() for line in window] != wanted:
+            continue
+        first_needle = needle.splitlines()[0]
+        shift = _indent_of(window[0]) - _indent_of(first_needle)
+        spans.append((offsets[index], offsets[index + len(wanted)], shift))
+    return spans
+
+
+def _indent_of(line: str) -> int:
+    return len(line) - len(line.lstrip())
+
+
+def _reindent(text: str, shift: int) -> str:
+    """Shift every line of ``text`` by ``shift`` columns, keeping its shape."""
+    if shift == 0:
+        return text
+    out = []
+    for line in text.splitlines(keepends=True):
+        stripped = line.lstrip()
+        if not stripped.strip():  # blank lines stay blank
+            out.append(line)
+            continue
+        indent = max(0, _indent_of(line) + shift)
+        out.append(" " * indent + stripped)
+    return "".join(out)
+
+
+def _near_misses(haystack: str, needle: str, limit: int = 3) -> str:
+    """Show what the file actually contains near what the caller asked for.
+
+    "Not found, try again" tells a model nothing it did not already know. The
+    lines it nearly matched, with whitespace made visible, tell it exactly what
+    to send next.
+    """
+    import difflib
+
+    first = next((line for line in needle.splitlines() if line.strip()), "")
+    if not first:
+        return "old_string was empty or whitespace only."
+
+    lines = haystack.splitlines()
+    scored = sorted(
+        ((difflib.SequenceMatcher(None, first.strip(), line.strip()).ratio(), n, line)
+         for n, line in enumerate(lines, 1)
+         if line.strip()),
+        key=lambda item: -item[0],
+    )[:limit]
+
+    if not scored or scored[0][0] < 0.5:
+        return (
+            f"Nothing in the file resembles {first.strip()[:80]!r}. "
+            "Read the file before editing it."
+        )
+
+    rendered = "\n".join(
+        f"  {number:>4}: {line.replace(' ', '·')}" for _score, number, line in scored
+    )
+    return (
+        "Closest lines in the file (· marks a space, so you can see the exact "
+        f"indentation):\n{rendered}\n"
+        "Copy one of those verbatim, or include more surrounding context."
+    )
+
+
 def register_file_tools(registry: ToolRegistry, config: Any) -> None:
     root = Path(config.root)
 
@@ -115,27 +201,57 @@ def register_file_tools(registry: ToolRegistry, config: Any) -> None:
             raise ToolError(f"File not found: {path}")
         original = target.read_text("utf-8")
 
-        occurrences = original.count(old_string)
-        # Fail loudly rather than silently no-op (R-203).
-        if occurrences == 0:
+        if old_string == new_string:
             raise ToolError(
-                f"old_string not found in {path}. The file was not modified. "
-                "Read the file and match the exact text, including indentation."
+                "old_string and new_string are identical, so this edit would do "
+                "nothing. If the file already reads the way you want, say so and "
+                "move on rather than editing it."
             )
+
+        occurrences = original.count(old_string)
         if occurrences > 1 and not replace_all:
             raise ToolError(
                 f"old_string appears {occurrences} times in {path} — ambiguous. "
                 "Include more surrounding context, or pass replace_all=true."
             )
-        if old_string == new_string:
-            raise ToolError("old_string and new_string are identical; nothing to do.")
 
-        updated = original.replace(old_string, new_string) if replace_all else original.replace(
-            old_string, new_string, 1
+        if occurrences == 1 or (occurrences > 1 and replace_all):
+            updated = (
+                original.replace(old_string, new_string)
+                if replace_all
+                else original.replace(old_string, new_string, 1)
+            )
+            target.write_text(updated, "utf-8")
+            count = occurrences if replace_all else 1
+            return f"Edited {_rel(root, target)} ({count} replacement{'s' if count != 1 else ''})"
+
+        # No exact match. Before failing, try matching on content while ignoring
+        # indentation: reproducing leading whitespace byte-for-byte is the single
+        # most common thing a small model gets wrong, and refusing an otherwise
+        # unambiguous edit over it costs an entire iteration. The match must
+        # still be unique, and the substitution is reported — this is a looser
+        # match, never a silent one (R-203).
+        loose = _match_ignoring_indentation(original, old_string)
+        if len(loose) == 1:
+            start, end, shift = loose[0]
+            updated = original[:start] + _reindent(new_string, shift) + original[end:]
+            target.write_text(updated, "utf-8")
+            return (
+                f"Edited {_rel(root, target)} (1 replacement; matched ignoring "
+                f"indentation — your old_string had different leading whitespace)"
+            )
+        if len(loose) > 1:
+            raise ToolError(
+                f"old_string is not in {path} exactly, and ignoring indentation it "
+                f"matches {len(loose)} places — ambiguous. Include more surrounding "
+                "context. The file was not modified."
+            )
+
+        # Fail loudly, and say what is actually there (R-203).
+        raise ToolError(
+            f"old_string not found in {path}. The file was not modified.\n"
+            + _near_misses(original, old_string)
         )
-        target.write_text(updated, "utf-8")
-        count = occurrences if replace_all else 1
-        return f"Edited {_rel(root, target)} ({count} replacement{'s' if count != 1 else ''})"
 
     registry.register(
         "edit_file",

@@ -299,6 +299,79 @@ async def test_R_203_edit_file_fails_loudly(registry, workspace):
     assert target.read_text() == "q\nb\nq\n"
 
 
+async def test_R_203_edit_tolerates_wrong_indentation(registry, workspace):
+    """Getting leading whitespace wrong is what a small model does constantly."""
+    source = (
+        "class Greeter:\n"
+        "    def greet(self):\n"
+        '        return "Hello, " + self.name\n'
+    )
+    target = workspace / "g.py"
+    target.write_text(source)
+
+    # The model sends the body with no indentation at all.
+    result = await registry.call(
+        "edit_file",
+        {
+            "path": "g.py",
+            "old_string": 'def greet(self):\n    return "Hello, " + self.name',
+            "new_string": 'def greet(self):\n    if not self.name:\n        return "Hi"\n    return "Hello, " + self.name',
+        },
+    )
+
+    assert result.ok, result.content
+    assert "ignoring indentation" in result.content, "a looser match must be stated"
+
+    updated = target.read_text()
+    compile(updated, "g.py", "exec")  # re-indented to fit, so it still parses
+    assert '    def greet(self):' in updated
+    assert '        if not self.name:' in updated
+    assert '            return "Hi"' in updated
+
+
+async def test_R_203_loose_match_must_still_be_unique(registry, workspace):
+    target = workspace / "dup.py"
+    target.write_text("a = 1\nif x:\n    a = 1\n")
+
+    result = await registry.call(
+        "edit_file", {"path": "dup.py", "old_string": "a = 1", "new_string": "a = 2"}
+    )
+
+    assert not result.ok
+    assert "ambiguous" in result.content
+    assert target.read_text() == "a = 1\nif x:\n    a = 1\n", "nothing may change"
+
+
+async def test_R_203_absent_string_reports_what_is_actually_there(registry, workspace):
+    target = workspace / "h.py"
+    target.write_text('def greet(name):\n    return "Hello, " + name\n')
+
+    result = await registry.call(
+        "edit_file",
+        {"path": "h.py", "old_string": 'return "Goodbye, " + nmae', "new_string": "x"},
+    )
+
+    assert not result.ok
+    assert "not found" in result.content
+    # The near-miss, with whitespace made visible so indentation is unambiguous.
+    assert "Hello" in result.content
+    assert "·" in result.content
+
+
+async def test_R_203_identical_strings_are_refused(registry, workspace):
+    """Gemma emitted exactly this: replace 'Hello, Ada!' with 'Hello, Ada!'."""
+    target = workspace / "i.py"
+    target.write_text("value = 1\n")
+
+    result = await registry.call(
+        "edit_file", {"path": "i.py", "old_string": "value", "new_string": "value"}
+    )
+
+    assert not result.ok
+    assert "identical" in result.content
+    assert target.read_text() == "value = 1\n"
+
+
 async def test_R_204_shell_tool(registry):
     """R-204: commands run with a timeout and captured output."""
     assert "shell" in registry.names()

@@ -77,6 +77,16 @@ user controls — including a phone.
   `list_dir`, `glob`, `grep`.
 - **R-203** — `edit_file` performs exact string replacement and **fails loudly**
   when the target string is absent or ambiguous. Silent no-ops are a defect.
+  Because the caller is a language model, two further properties are required:
+  - **indentation tolerance.** If no exact match exists, the text is matched
+    again with leading whitespace ignored. That match must still be *unique*,
+    the replacement is re-indented to fit where it lands, and the looser match
+    is stated in the result. Reproducing indentation byte-for-byte is the single
+    most common thing a small model gets wrong, and refusing an otherwise
+    unambiguous edit over it costs a whole iteration.
+  - **useful failure.** When the text genuinely is not there, the error shows
+    the closest lines actually in the file with whitespace made visible.
+    "Not found, try again" tells the model nothing it did not already know.
 - **R-204** — A shell tool executes commands with a timeout and captured
   stdout/stderr/exit code.
 - **R-205** — All filesystem and shell access is confined to a workspace root.

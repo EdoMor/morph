@@ -180,6 +180,8 @@ class Agent:
         stop_reason = "end_turn"
         error: str | None = None
         steps = 0
+        successful_calls = 0
+        nudged_to_act = False
 
         specs = self.tools.specs()
 
@@ -231,6 +233,31 @@ class Agent:
                     )
                     continue
 
+                # A statement of intent is not a result. Small models routinely
+                # reply "I will edit X to do Y" and stop; the loop then reads a
+                # text-only turn as completion and ends having changed nothing.
+                # Across eight recorded iterations the mean was 3 steps of a
+                # 60-step budget — not running out of room, just stopping.
+                # Nudge once, then respect the answer.
+                if (
+                    not successful_calls
+                    and not nudged_to_act
+                    and steps < budget
+                    and _reads_like_an_unexecuted_plan(response.text)
+                ):
+                    nudged_to_act = True
+                    active.assistant(response.text)
+                    active.tool("supervisor", _act_on_your_plan_guidance(), ok=False)
+                    yield AgentEvent(
+                        "error",
+                        {
+                            "message": "the model described an action without taking it; asking it to act",
+                            "recoverable": True,
+                            "step": steps,
+                        },
+                    )
+                    continue
+
                 active.assistant(response.text)
                 stop_reason = response.stop_reason or "end_turn"
                 break
@@ -250,6 +277,7 @@ class Agent:
                 )
                 result = await self._invoke(call)
                 tool_log.append(result.to_dict())  # every call is recorded (R-108)
+                successful_calls += int(result.ok)
                 active.tool(call.name, result.content, call_id=call.id, ok=result.ok)
                 yield AgentEvent(
                     "tool_result",
@@ -286,6 +314,53 @@ class Agent:
     async def _invoke(self, call: ToolCall) -> ToolResult:
         """Execute one tool call. Failures become results, not exceptions (R-109)."""
         return await self.tools.call(call.name, call.arguments)
+
+
+#: Phrases a model uses to announce an action it has not taken. Paired with
+#: "has not successfully called a single tool yet", these are a reliable signal
+#: that a turn is a plan rather than an answer.
+INTENT_PHRASES = (
+    "i will ",
+    "i'll ",
+    "i am going to",
+    "i'm going to",
+    "let me ",
+    "let's ",
+    "i plan to",
+    "i intend to",
+    "next, i",
+    "my plan",
+    "here's my plan",
+    "i should ",
+    "we should ",
+)
+
+
+def _reads_like_an_unexecuted_plan(text: str) -> bool:
+    """True when a reply announces work rather than reporting it.
+
+    Deliberately paired with a zero successful-tool-call count at the call site:
+    on its own this would misfire on a legitimate answer that happens to say
+    "I'll leave that alone". After real work has happened, it never fires.
+    """
+    body = " ".join((text or "").lower().split())
+    if len(body) < 40:  # "Done." and friends are answers, not plans
+        return False
+    return any(phrase in body for phrase in INTENT_PHRASES)
+
+
+def _act_on_your_plan_guidance() -> str:
+    """What the model is told when it narrates instead of acting."""
+    return (
+        "You described what you were going to do, but you have not run a single "
+        "tool yet, so none of it has happened: no file has been read, and nothing "
+        "has been changed. Describing an edit does not perform it.\n\n"
+        "Do the next concrete step now as a tool call. If the step you described "
+        "needs information you do not have, read or search for it first.\n\n"
+        "If you have genuinely concluded there is nothing worth changing, say so "
+        "plainly and explain why — that is a valid outcome, and it will be "
+        "recorded. What is not useful is a plan nobody carries out."
+    )
 
 
 def _malformed_call_guidance(errors: list[str]) -> str:

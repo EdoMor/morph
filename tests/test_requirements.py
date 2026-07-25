@@ -1932,3 +1932,111 @@ def test_R_719_prompt_distinguishes_repo_bugs_from_benchmark_fixtures():
 
     # bench/tasks/ is readable for understanding but never editable.
     assert "read-only" in guide or "never edit" in guide
+
+
+def test_R_720_a_plan_is_not_an_answer(config, registry):
+    """R-720: replayed from the real runs, where this cost eight iterations."""
+    import asyncio
+
+    from morph.agent import _reads_like_an_unexecuted_plan
+
+    # Verbatim closing lines from runs #1, #3 and #4 — all followed by nothing.
+    for plan in (
+        "I will use replace_all=true. I'll edit morph/agent.py to replace all "
+        "instances of 'hello world' with 'goodbye world'.",
+        "I'll edit morph/agent.py to add a check for an empty list before "
+        "calculating the average. I'll also add a comment explaining the change.",
+        "Let me use grep to confirm the exact text and location of the error, "
+        "and then manually edit the file using edit_file.",
+    ):
+        assert _reads_like_an_unexecuted_plan(plan), f"missed a real plan: {plan[:60]}"
+
+    # Real answers must never trip it.
+    for answer in (
+        "Done.",
+        "Guarded the empty case in calc.py; non-empty behaviour is unchanged.",
+        "I fixed the empty-list guard and re-ran the suite, which is green.",
+    ):
+        assert not _reads_like_an_unexecuted_plan(answer), f"false positive: {answer}"
+
+    del asyncio  # imported only to document that the check itself is sync
+
+
+async def test_R_720_agent_nudges_a_narrating_model_into_acting(config, registry):
+    """The loop must not end on 'I will edit X' having changed nothing."""
+    from morph.llm.base import ModelResponse
+
+    class Narrator:
+        """Announces an edit, then performs it only when pushed."""
+
+        name = "narrator"
+        supports_native_tools = True
+
+        def __init__(self) -> None:
+            self.turns: list[list[dict]] = []
+
+        async def complete(self, messages, tools=None, **kwargs):  # noqa: ANN001, ANN003
+            self.turns.append(list(messages))
+            if len(self.turns) == 1:
+                return ModelResponse(
+                    text="I will edit notes.txt to record the fix, then verify it."
+                )
+            if len(self.turns) == 2:
+                return EchoProvider.call("write_file", path="notes.txt", content="done\n")
+            return ModelResponse(text="Wrote notes.txt.")
+
+    provider = Narrator()
+    agent = Agent(config=config, provider=provider, tools=registry, skills=SkillRegistry())
+    result = await agent.run("Record the fix.", max_steps=8)
+
+    assert result.steps >= 3, "the run ended on the plan instead of pushing back"
+    assert (config.root / "notes.txt").is_file(), "the announced edit never happened"
+
+    # The model must have been told, specifically, that nothing had happened.
+    pushback = json.dumps(provider.turns[1])
+    assert "not run a single tool" in pushback
+    assert "does not perform it" in pushback
+
+
+async def test_R_720_nudge_fires_at_most_once_and_never_after_real_work(config, registry):
+    """A model that has done the work, or that means it, is left alone."""
+    from morph.llm.base import ModelResponse
+
+    class Stubborn:
+        name = "stubborn"
+        supports_native_tools = True
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def complete(self, messages, tools=None, **kwargs):  # noqa: ANN001, ANN003
+            self.calls += 1
+            return ModelResponse(text="I will look into this properly next time round.")
+
+    provider = Stubborn()
+    agent = Agent(config=config, provider=provider, tools=registry, skills=SkillRegistry())
+    result = await agent.run("Do something.", max_steps=10)
+
+    assert provider.calls == 2, "one nudge, then the answer is respected"
+    assert result.stop_reason == "end_turn"
+    assert result.steps == 2
+
+    # And after successful work, a plan-shaped sign-off is not second-guessed.
+    class Worker:
+        name = "worker"
+        supports_native_tools = True
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def complete(self, messages, tools=None, **kwargs):  # noqa: ANN001, ANN003
+            self.calls += 1
+            if self.calls == 1:
+                return EchoProvider.call("write_file", path="a.txt", content="x")
+            return ModelResponse(text="I will leave the rest of the module alone for now.")
+
+    worker = Worker()
+    agent = Agent(config=config, provider=worker, tools=registry, skills=SkillRegistry())
+    await agent.run("Write a.txt.", max_steps=10)
+
+    assert worker.calls == 2, "a sign-off after real work must not be challenged"

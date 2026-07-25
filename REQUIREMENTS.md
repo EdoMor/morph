@@ -59,6 +59,16 @@ user controls — including a phone.
     failed tool result so it can retry, never dropped and treated as prose.
     Dropping it ends the run at that step having done nothing, with the model
     never learning why.
+- **R-720** — **A statement of intent is not a result.** If the model replies
+  with prose that announces work ("I will edit X to do Y") without having
+  successfully called a single tool, the loop must not treat that as a finished
+  answer. It nudges once — telling the model that nothing it described has
+  happened, and to either act or state plainly that there is nothing to do —
+  and then respects whatever comes back. Across eight recorded iterations of the
+  real loop, the mean was **3 steps used of a 60-step budget**: the agent was
+  not running out of room, it was narrating a plan and stopping. The nudge fires
+  at most once per run and never after real work has occurred, so a legitimate
+  final answer is never second-guessed.
 - **R-106** — Conversations are persisted as append-only JSONL sessions and can
   be resumed by id, with no loss of tool calls or results.
 - **R-107** — A run emits a structured event stream (`text`, `tool_use`,

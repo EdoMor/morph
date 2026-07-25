@@ -399,21 +399,41 @@ def test_iteration_accepted_when_the_score_holds_or_improves(iteration_harness, 
 
 
 def test_iteration_leaves_no_worktree_or_branch_behind(iteration_harness, repo_root, say):
-    """Every iteration cleans up after itself, accepted or not."""
+    """Every iteration cleans up after itself, accepted or not.
+
+    Asserted as a delta, not as absolute git state. When the benchmark runs
+    *inside* a self-improvement iteration, the parent loop's own worktree is
+    legitimately present — a test that demanded a globally clean worktree list
+    would fail there, and since the conformance suite gates acceptance, that
+    would make the loop reject every iteration it ever produced.
+    """
     import subprocess as sp
 
+    def git_state() -> tuple[set[str], set[str]]:
+        worktrees = sp.run(
+            ["git", "worktree", "list", "--porcelain"],
+            cwd=repo_root,
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout
+        branches = sp.run(
+            ["git", "branch", "--list", "selfimprove/*"],
+            cwd=repo_root,
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout
+        paths = {
+            line.split(" ", 1)[1]
+            for line in worktrees.splitlines()
+            if line.startswith("worktree ")
+        }
+        return paths, {b.strip(" *+") for b in branches.splitlines() if b.strip()}
+
+    before_worktrees, before_branches = git_state()
     iteration_harness([say("Nothing to do.")])
+    after_worktrees, after_branches = git_state()
 
-    worktrees = sp.run(
-        ["git", "worktree", "list"], cwd=repo_root, capture_output=True, text=True, check=True
-    ).stdout
-    branches = sp.run(
-        ["git", "branch", "--list", "selfimprove/*"],
-        cwd=repo_root,
-        capture_output=True,
-        text=True,
-        check=True,
-    ).stdout
-
-    assert "selfimprove" not in worktrees
-    assert branches.strip() == ""
+    assert after_worktrees - before_worktrees == set(), "an iteration leaked a worktree"
+    assert after_branches - before_branches == set(), "an iteration leaked a branch"

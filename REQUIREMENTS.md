@@ -59,16 +59,23 @@ user controls — including a phone.
     failed tool result so it can retry, never dropped and treated as prose.
     Dropping it ends the run at that step having done nothing, with the model
     never learning why.
-- **R-720** — **A statement of intent is not a result.** If the model replies
-  with prose that announces work ("I will edit X to do Y") without having
-  successfully called a single tool, the loop must not treat that as a finished
-  answer. It nudges once — telling the model that nothing it described has
-  happened, and to either act or state plainly that there is nothing to do —
-  and then respects whatever comes back. Across eight recorded iterations of the
-  real loop, the mean was **3 steps used of a 60-step budget**: the agent was
-  not running out of room, it was narrating a plan and stopping. The nudge fires
-  at most once per run and never after real work has occurred, so a legitimate
-  final answer is never second-guessed.
+- **R-720** — **Neither a plan nor a claim is a result.** A text-only reply that
+  describes an edit must not end the run when no edit has actually been made.
+  Two forms occur, and both are fatal in the same way:
+  - the *plan* — "I will edit X to do Y" — the model announces work and stops;
+  - the *claim* — "**Change:** Modified the `_malformed_call_guidance` function
+    to…" — the model reports work it never performed. This is the more dangerous
+    of the two, because the summary is written to the run history as if it
+    happened, teaching the next iteration a false lesson.
+
+  When no call to `edit_file` or `write_file` has succeeded in this run and the
+  reply reads as either form, the loop hands it back with the specific fact that
+  no editing tool has run, and asks the model to either make the edit or say
+  plainly that there is nothing to change — an outcome that stays valid, but has
+  to be stated rather than implied. Reading files is not enough to clear the
+  guard: run #5 read `morph/agent.py`, then reported an edit it never made.
+  At most two such nudges per run, so a wrong guess costs one turn and never
+  loops.
 - **R-106** — Conversations are persisted as append-only JSONL sessions and can
   be resumed by id, with no loss of tool calls or results.
 - **R-107** — A run emits a structured event stream (`text`, `tool_use`,

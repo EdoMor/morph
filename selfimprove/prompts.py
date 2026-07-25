@@ -52,6 +52,11 @@ Rules:
 - Do not add new third-party dependencies. Morph has to run on a phone.
 - Do not delete or weaken tests to make them pass.
 - Prefer fixing the cause over widening an exception handler.
+- Never summarise a change you have not made. If your final message says a file
+  was modified, a successful `edit_file` or `write_file` call for it must appear
+  earlier in this session. Deciding that nothing needs changing is a legitimate
+  outcome; reporting an edit that never happened is not, and it poisons the
+  history the next iteration reads.
 """
 
 

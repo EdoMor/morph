@@ -1935,10 +1935,8 @@ def test_R_719_prompt_distinguishes_repo_bugs_from_benchmark_fixtures():
 
 
 def test_R_720_a_plan_is_not_an_answer(config, registry):
-    """R-720: replayed from the real runs, where this cost eight iterations."""
-    import asyncio
-
-    from morph.agent import _reads_like_an_unexecuted_plan
+    """R-720: replayed from the real runs, where this cost nine iterations."""
+    from morph.agent import _describes_work_that_did_not_happen as classify
 
     # Verbatim closing lines from runs #1, #3 and #4 — all followed by nothing.
     for plan in (
@@ -1949,17 +1947,29 @@ def test_R_720_a_plan_is_not_an_answer(config, registry):
         "Let me use grep to confirm the exact text and location of the error, "
         "and then manually edit the file using edit_file.",
     ):
-        assert _reads_like_an_unexecuted_plan(plan), f"missed a real plan: {plan[:60]}"
+        assert classify(plan) == "plan", f"missed a real plan: {plan[:60]}"
 
-    # Real answers must never trip it.
-    for answer in (
-        "Done.",
-        "Guarded the empty case in calc.py; non-empty behaviour is unchanged.",
+    # Run #5, iteration 1: reported as done, never done. The worse form — this
+    # is what gets written to the history as the iteration's summary.
+    for claim in (
+        "Excellent! The change to the `_malformed_call_guidance` function seems "
+        "to have resolved the issue. **Summary:** * **Change:** Modified the "
+        "function to provide a more concise and targeted error message.",
         "I fixed the empty-list guard and re-ran the suite, which is green.",
     ):
-        assert not _reads_like_an_unexecuted_plan(answer), f"false positive: {answer}"
+        assert classify(claim) == "claim", f"missed a false report: {claim[:60]}"
 
-    del asyncio  # imported only to document that the check itself is sync
+    # Prose that is neither must never trip it.
+    for answer in (
+        "Done.",
+        "This module implements a bounded tool-use loop. I should note that it "
+        "returns as soon as a reply carries no tool calls, which is why the "
+        "step count stays low.",
+        "I read morph/agent.py and morph/tools/files.py and found no defect in "
+        "the retry path; the failing check is about benchmark fixtures, so "
+        "there is nothing here worth changing.",
+    ):
+        assert classify(answer) is None, f"false positive: {answer[:60]}"
 
 
 async def test_R_720_agent_nudges_a_narrating_model_into_acting(config, registry):
@@ -1994,12 +2004,54 @@ async def test_R_720_agent_nudges_a_narrating_model_into_acting(config, registry
 
     # The model must have been told, specifically, that nothing had happened.
     pushback = json.dumps(provider.turns[1])
-    assert "not run a single tool" in pushback
-    assert "does not perform it" in pushback
+    assert "no editing tool has run in this session" in pushback
+    assert "edit_file" in pushback
 
 
-async def test_R_720_nudge_fires_at_most_once_and_never_after_real_work(config, registry):
+async def test_R_720_reading_a_file_does_not_licence_claiming_an_edit(config, registry):
+    """Run #5, iteration 1, exactly: read the right file, then invent the edit.
+
+    A successful `read_file` must not clear the guard. It did not change
+    anything, and the summary the model then wrote was false.
+    """
+    from morph.llm.base import ModelResponse
+
+    (config.root / "agent.py").write_text("guidance = 'verbose'\n", "utf-8")
+
+    class Fabricator:
+        name = "fabricator"
+        supports_native_tools = True
+
+        def __init__(self) -> None:
+            self.turns: list[list[dict]] = []
+
+        async def complete(self, messages, tools=None, **kwargs):  # noqa: ANN001, ANN003
+            self.turns.append(list(messages))
+            if len(self.turns) == 1:
+                return EchoProvider.call("read_file", path="agent.py")
+            if len(self.turns) == 2:
+                return ModelResponse(
+                    text=(
+                        "**Summary:** * **Change:** Modified the guidance "
+                        "function to provide a more concise error message, "
+                        "which resolves the failing check."
+                    )
+                )
+            return EchoProvider.call("write_file", path="agent.py", content="guidance = 'short'\n")
+
+    provider = Fabricator()
+    agent = Agent(config=config, provider=provider, tools=registry, skills=SkillRegistry())
+    result = await agent.run("Improve the guidance message.", max_steps=8)
+
+    assert result.steps >= 3, "a read cleared the guard and the fiction was accepted"
+    assert (config.root / "agent.py").read_text("utf-8") == "guidance = 'short'\n"
+    pushback = json.dumps(provider.turns[2])
+    assert "does not exist" in pushback, "the model was not told its summary was false"
+
+
+async def test_R_720_nudge_is_bounded_and_never_fires_after_real_work(config, registry):
     """A model that has done the work, or that means it, is left alone."""
+    from morph.agent import MAX_ACT_NUDGES
     from morph.llm.base import ModelResponse
 
     class Stubborn:
@@ -2011,17 +2063,17 @@ async def test_R_720_nudge_fires_at_most_once_and_never_after_real_work(config, 
 
         async def complete(self, messages, tools=None, **kwargs):  # noqa: ANN001, ANN003
             self.calls += 1
-            return ModelResponse(text="I will look into this properly next time round.")
+            return ModelResponse(text="I will look into changing this properly next time round.")
 
     provider = Stubborn()
     agent = Agent(config=config, provider=provider, tools=registry, skills=SkillRegistry())
     result = await agent.run("Do something.", max_steps=10)
 
-    assert provider.calls == 2, "one nudge, then the answer is respected"
+    assert provider.calls == MAX_ACT_NUDGES + 1, "the nudge must not loop"
     assert result.stop_reason == "end_turn"
-    assert result.steps == 2
+    assert result.steps == MAX_ACT_NUDGES + 1
 
-    # And after successful work, a plan-shaped sign-off is not second-guessed.
+    # And after a real edit, a narration-shaped sign-off is not second-guessed.
     class Worker:
         name = "worker"
         supports_native_tools = True
@@ -2033,7 +2085,7 @@ async def test_R_720_nudge_fires_at_most_once_and_never_after_real_work(config, 
             self.calls += 1
             if self.calls == 1:
                 return EchoProvider.call("write_file", path="a.txt", content="x")
-            return ModelResponse(text="I will leave the rest of the module alone for now.")
+            return ModelResponse(text="I changed a.txt and will leave the rest unchanged.")
 
     worker = Worker()
     agent = Agent(config=config, provider=worker, tools=registry, skills=SkillRegistry())

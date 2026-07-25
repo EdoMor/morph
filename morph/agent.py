@@ -180,8 +180,8 @@ class Agent:
         stop_reason = "end_turn"
         error: str | None = None
         steps = 0
-        successful_calls = 0
-        nudged_to_act = False
+        edits_made = 0
+        act_nudges = 0
 
         specs = self.tools.specs()
 
@@ -233,25 +233,34 @@ class Agent:
                     )
                     continue
 
-                # A statement of intent is not a result. Small models routinely
-                # reply "I will edit X to do Y" and stop; the loop then reads a
-                # text-only turn as completion and ends having changed nothing.
+                # Describing a change is not making one (R-720). Small models
+                # end a turn either announcing an edit ("I will edit X to do Y")
+                # or reporting one they never performed — and a text-only turn
+                # reads as completion, so the run ends having changed nothing.
                 # Across eight recorded iterations the mean was 3 steps of a
-                # 60-step budget — not running out of room, just stopping.
-                # Nudge once, then respect the answer.
-                if (
-                    not successful_calls
-                    and not nudged_to_act
-                    and steps < budget
-                    and _reads_like_an_unexecuted_plan(response.text)
-                ):
-                    nudged_to_act = True
+                # 60-step budget: not running out of room, just stopping.
+                # Gated on "no editing tool has succeeded", so once real work
+                # exists this can never fire.
+                narration = (
+                    _describes_work_that_did_not_happen(response.text)
+                    if not edits_made and act_nudges < MAX_ACT_NUDGES and steps < budget
+                    else None
+                )
+                if narration:
+                    act_nudges += 1
                     active.assistant(response.text)
-                    active.tool("supervisor", _act_on_your_plan_guidance(), ok=False)
+                    active.tool(
+                        "supervisor", _act_on_your_plan_guidance(narration), ok=False
+                    )
                     yield AgentEvent(
                         "error",
                         {
-                            "message": "the model described an action without taking it; asking it to act",
+                            "message": (
+                                "the model reported an edit it never made; asking it to act"
+                                if narration == "claim"
+                                else "the model described an action without taking it; asking it to act"
+                            ),
+                            "kind": narration,
                             "recoverable": True,
                             "step": steps,
                         },
@@ -277,7 +286,7 @@ class Agent:
                 )
                 result = await self._invoke(call)
                 tool_log.append(result.to_dict())  # every call is recorded (R-108)
-                successful_calls += int(result.ok)
+                edits_made += int(result.ok and call.name in EDITING_TOOLS)
                 active.tool(call.name, result.content, call_id=call.id, ok=result.ok)
                 yield AgentEvent(
                     "tool_result",
@@ -316,9 +325,19 @@ class Agent:
         return await self.tools.call(call.name, call.arguments)
 
 
-#: Phrases a model uses to announce an action it has not taken. Paired with
-#: "has not successfully called a single tool yet", these are a reliable signal
-#: that a turn is a plan rather than an answer.
+#: Tools whose success means a file actually changed. Reading, grepping and
+#: listing do not clear the guard below — an iteration that read the right file
+#: and then reported an edit it never made is the exact case this catches.
+EDITING_TOOLS = frozenset({"edit_file", "write_file"})
+
+#: How many times one run may be told that its description is not a result.
+#: More than one because these models repeat themselves; bounded because a wrong
+#: guess should cost a turn, not the iteration.
+MAX_ACT_NUDGES = 2
+
+#: Phrases announcing work not yet done. Required to co-occur with an editing
+#: word, so "I should note that this returns None" in an answer to a read-only
+#: question is not mistaken for an abandoned plan.
 INTENT_PHRASES = (
     "i will ",
     "i'll ",
@@ -335,31 +354,101 @@ INTENT_PHRASES = (
     "we should ",
 )
 
+#: Words that make a sentence about changing code rather than about anything
+#: else. Stems, so "modify"/"modified"/"modification" all count.
+EDITING_WORDS = (
+    "edit",
+    "write",
+    "replace",
+    "modif",
+    "chang",
+    "fix",
+    "updat",
+    "patch",
+    "rewrit",
+    "refactor",
+    # not "implement": "this module implements a loop" is description, not intent
+    " add ",
+    "remove",
+    "delete",
+)
 
-def _reads_like_an_unexecuted_plan(text: str) -> bool:
-    """True when a reply announces work rather than reporting it.
+#: Phrases reporting work as already done. These need no second condition —
+#: each is a first-person or summary-style assertion that an edit happened, and
+#: the call site only consults them when no editing tool has succeeded, so the
+#: assertion is necessarily false.
+CLAIM_PHRASES = (
+    "i modified",
+    "i changed",
+    "i updated",
+    "i added",
+    "i fixed",
+    "i edited",
+    "i replaced",
+    "i removed",
+    "i've modified",
+    "i've changed",
+    "i've updated",
+    "i've added",
+    "i've fixed",
+    "i have modified",
+    "i have changed",
+    "i have updated",
+    "i have added",
+    "i have fixed",
+    "i made the change",
+    "modified the",
+    "changed the",
+    "updated the",
+    "replaced the",
+    "the change to",
+    "this change",
+    "after making",
+    "**change:**",
+    "changes made",
+)
 
-    Deliberately paired with a zero successful-tool-call count at the call site:
-    on its own this would misfire on a legitimate answer that happens to say
-    "I'll leave that alone". After real work has happened, it never fires.
+
+def _describes_work_that_did_not_happen(text: str) -> str | None:
+    """``"claim"``, ``"plan"``, or ``None``.
+
+    Only meaningful when paired with "no editing tool has succeeded" at the call
+    site — that is what makes a claim provably false and a plan provably
+    unexecuted. Claims are checked first: a reply asserting a finished edit is
+    worse than one merely proposing it, because the loop records the summary.
     """
     body = " ".join((text or "").lower().split())
-    if len(body) < 40:  # "Done." and friends are answers, not plans
-        return False
-    return any(phrase in body for phrase in INTENT_PHRASES)
+    if len(body) < 40:  # "Done." and friends are answers, not narration
+        return None
+    if any(phrase in body for phrase in CLAIM_PHRASES):
+        return "claim"
+    if any(phrase in body for phrase in INTENT_PHRASES) and any(
+        word in body for word in EDITING_WORDS
+    ):
+        return "plan"
+    return None
 
 
-def _act_on_your_plan_guidance() -> str:
+def _act_on_your_plan_guidance(kind: str) -> str:
     """What the model is told when it narrates instead of acting."""
+    opening = (
+        "You have described a change as though it were finished, but no editing "
+        "tool has run in this session: `edit_file` and `write_file` have not "
+        "been called successfully even once. Reading a file does not change it, "
+        "and neither does describing the change. The edit you summarised does "
+        "not exist."
+        if kind == "claim"
+        else "You described what you were going to do, but no editing tool has "
+        "run in this session — `edit_file` and `write_file` have not been "
+        "called successfully even once — so none of it has happened yet."
+    )
     return (
-        "You described what you were going to do, but you have not run a single "
-        "tool yet, so none of it has happened: no file has been read, and nothing "
-        "has been changed. Describing an edit does not perform it.\n\n"
-        "Do the next concrete step now as a tool call. If the step you described "
-        "needs information you do not have, read or search for it first.\n\n"
+        f"{opening}\n\n"
+        "Make the edit now as a tool call. If you need to see the exact text "
+        "first, read the file, then call `edit_file` with the old and new text.\n\n"
         "If you have genuinely concluded there is nothing worth changing, say so "
-        "plainly and explain why — that is a valid outcome, and it will be "
-        "recorded. What is not useful is a plan nobody carries out."
+        "plainly and explain why — that is a valid outcome and it will be "
+        "recorded. What is not useful is a change that exists only in prose."
     )
 
 

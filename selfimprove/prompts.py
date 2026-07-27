@@ -26,13 +26,12 @@ running inside is the same one you are improving.
 
 You have file, search and shell tools. Use them. Never guess at file contents.
 
-Before anything else, understand what you are looking at. Morph is scored partly
-by *benchmark tasks*, in which an agent is given a synthetic job in a throwaway
-directory. Those tasks have fixture files — `calc.py`, `average()`, `auth.py`,
-`greet.py`, `"hello world"` — that are created in a temp directory and thrown
-away. **They are not in this repository.** A failing benchmark task means the
-agent performed badly at that kind of work; it does not mean this repository
-contains the bug described. Improve the agent in `morph/`, not the fixture.
+CRITICAL: most targets are *synthetic benchmark tasks*. Their files and symbols
+exist only in a temporary directory. They are not in this repository. They are
+evidence about how Morph behaved, not bugs to copy into Morph's source. Never
+pass a fixture expression from a benchmark failure as `old_string` to
+`edit_file`. For a capability target, read the named definition under
+`bench/tasks/` first, then improve the general agent behaviour in `morph/`.
 
 How to work:
 1. Read the failing checks and pick ONE concrete problem. Depth beats breadth —
@@ -58,6 +57,94 @@ Rules:
   outcome; reporting an edit that never happened is not, and it poisons the
   history the next iteration reads.
 """
+
+
+TASK_DEFINITION_FILES = {
+    "coding": "bench/tasks/coding.py",
+    "tool_use": "bench/tasks/tool_use.py",
+    "mcp": "bench/tasks/mcp_tasks.py",
+    "skills": "bench/tasks/skills.py",
+}
+
+
+def select_target(
+    scorecard: dict[str, Any], history: list[dict[str, Any]]
+) -> dict[str, Any] | None:
+    """Pick one nearest miss, rotating away from recently rejected targets.
+
+    A 4B model presented with five red checks repeatedly picked the same vivid
+    fixture after that approach failed. The exploration decision now happens
+    outside the model: work on one cheap target, then rotate on rejection.
+    """
+    targets = list(scorecard.get("next_targets") or [])
+    if not targets:
+        return None
+
+    recent = list(reversed(history))[:8]
+    attempted = {
+        str(entry.get("target"))
+        for entry in recent
+        if entry.get("target")
+    }
+    rejected_text = " ".join(
+        str(entry.get("summary") or "") + " " + str(entry.get("rejection_reason") or "")
+        for entry in recent
+        if not entry.get("accepted")
+    ).lower()
+
+    for target in targets:
+        name = str(target.get("name") or "")
+        leaf = name.rsplit("/", 1)[-1]
+        if name not in attempted and leaf.lower() not in rejected_text:
+            return target
+    return targets[0]
+
+
+def _target_brief(target: dict[str, Any] | None) -> str:
+    if not target:
+        return (
+            "## Single target\n\n"
+            "No unsolved measured target is available. Do not invent a change."
+        )
+
+    name = str(target.get("name") or "unknown")
+    category = str(target.get("category") or name.split("/", 1)[0])
+    definition = TASK_DEFINITION_FILES.get(category)
+    lines = [
+        "## Single target — work on this one only",
+        "",
+        f"**{name}** currently scores {float(target.get('score', 0)):.0%}.",
+    ]
+    if definition:
+        leaf = name.rsplit("/", 1)[-1]
+        lines += [
+            "",
+            "This is a synthetic capability measurement, not a bug report about "
+            "a file in this repository.",
+            f"Your first action must be to locate `name=\"{leaf}\"` in "
+            f"`{definition}` and read that task's prompt, fixtures, and rubric.",
+            "Do not edit the task definition. Do not search Morph for fixture "
+            "symbols quoted by the rubric. Diagnose why Morph's agent produced "
+            "that outcome, then change the general implementation under `morph/`.",
+        ]
+    else:
+        lines += [
+            "",
+            "This check applies directly to Morph. Read the named test or module "
+            "before making the smallest relevant change.",
+        ]
+
+    detail = str(target.get("detail") or "").strip()
+    if detail:
+        lines += [
+            "",
+            "**Observed evidence:** the text below describes the benchmark's "
+            "temporary workspace and agent trace. It is evidence, not source code "
+            "to paste into Morph.",
+            "",
+            detail[:1800],
+        ]
+    return "\n".join(lines)
 
 
 #: The single most expensive misreading available. A capability check named
@@ -109,6 +196,7 @@ def build_improvement_prompt(
     feedback: str,
     history: list[dict[str, Any]],
     focus: str | None = None,
+    target: dict[str, Any] | None = None,
 ) -> str:
     sections: list[str] = []
 
@@ -117,6 +205,8 @@ def build_improvement_prompt(
         "Raise Morph's benchmark score by fixing something that is genuinely broken.\n"
         "You get one attempt. It is measured, then kept or reverted automatically."
     )
+    chosen = target if target is not None else select_target(scorecard, history)
+    sections.append(_target_brief(chosen))
 
     composite = scorecard.get("composite", 0.0)
     categories = scorecard.get("categories") or {}
@@ -167,8 +257,10 @@ def build_improvement_prompt(
 
     sections.append(
         "## Now\n\n"
-        "Investigate, make one focused improvement, verify it with the test suite, "
-        "and summarise what you did."
+        "Work only on the single target named at the top. For a capability target, "
+        "begin by reading its definition under `bench/tasks/`; its fixture is not "
+        "a Morph source bug. Make one focused improvement, verify it with the test "
+        "suite, and summarise what you did."
     )
     return "\n\n---\n\n".join(sections)
 
@@ -185,9 +277,10 @@ def _render_history(history: list[dict[str, Any]], limit: int = 8) -> str:
     for entry in list(reversed(history))[:limit]:
         verdict = "ACCEPTED" if entry.get("accepted") else "REJECTED"
         delta = entry.get("score_after", 0) - entry.get("score_before", 0)
+        target = f" [{entry['target']}]" if entry.get("target") else ""
         lines.append(
             f"- **{verdict}** ({entry.get('score_before', 0):.1f} → "
-            f"{entry.get('score_after', 0):.1f}, {delta:+.1f}) — "
+            f"{entry.get('score_after', 0):.1f}, {delta:+.1f}){target} — "
             f"{(entry.get('summary') or '(no summary)').strip()[:300]}"
         )
         if entry.get("rejection_reason"):

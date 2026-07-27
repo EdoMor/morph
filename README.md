@@ -348,6 +348,7 @@ made earlier would point at an orphaned commit.
 | `MORPH_PROVIDER` / `MORPH_MODEL` | model selection |
 | `MORPH_IMAGE_BACKEND` | `stub` \| `flux` \| `gemini` \| `local` |
 | `MORPH_BENCH_PROVIDER` | force the benchmark's provider (e.g. `echo` for a fast run) |
+| `MORPH_BENCH_TEMPERATURE` | benchmark temperature; defaults to `0` so score deltas are comparable |
 | `GOOGLE_API_KEY`, `FLUX_API_KEY`, `MORPH_SEARCH_API_KEY` | credentials — environment only, never written to disk |
 
 ## Skills

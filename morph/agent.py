@@ -96,6 +96,7 @@ class Agent:
         tools: ToolRegistry | None = None,
         skills: SkillRegistry | None = None,
         system_prompt: str = SYSTEM_PROMPT,
+        require_edit: bool = False,
     ) -> None:
         self.config = config or load_config()
         self.provider = provider or get_provider(
@@ -109,6 +110,10 @@ class Agent:
         self.sessions = SessionStore(self.config.path(self.config.sessions_dir))
         self.mcp = MCPManager(self.tools)
         self.base_system_prompt = system_prompt
+        # Ordinary Morph sessions include read-only questions, so prose is
+        # usually a valid completion. A self-improvement iteration exists to
+        # attempt a code change. It opts into this stricter completion policy.
+        self.require_edit = require_edit
         self._started = False
 
     # ------------------------------------------------------------------
@@ -241,11 +246,15 @@ class Agent:
                 # 60-step budget: not running out of room, just stopping.
                 # Gated on "no editing tool has succeeded", so once real work
                 # exists this can never fire.
-                narration = (
-                    _describes_work_that_did_not_happen(response.text)
-                    if not edits_made and act_nudges < MAX_ACT_NUDGES and steps < budget
-                    else None
-                )
+                narration = None
+                if not edits_made and act_nudges < MAX_ACT_NUDGES and steps < budget:
+                    narration = _describes_work_that_did_not_happen(response.text)
+                    if (
+                        narration is None
+                        and self.require_edit
+                        and not _explicitly_declines_a_change(response.text)
+                    ):
+                        narration = "attempt"
                 if narration:
                     act_nudges += 1
                     active.assistant(response.text)
@@ -258,7 +267,11 @@ class Agent:
                             "message": (
                                 "the model reported an edit it never made; asking it to act"
                                 if narration == "claim"
-                                else "the model described an action without taking it; asking it to act"
+                                else (
+                                    "the model described an action without taking it; asking it to act"
+                                    if narration == "plan"
+                                    else "the change attempt ended without an edit; asking it to act"
+                                )
                             ),
                             "kind": narration,
                             "recoverable": True,
@@ -333,7 +346,7 @@ EDITING_TOOLS = frozenset({"edit_file", "write_file"})
 #: How many times one run may be told that its description is not a result.
 #: More than one because these models repeat themselves; bounded because a wrong
 #: guess should cost a turn, not the iteration.
-MAX_ACT_NUDGES = 2
+MAX_ACT_NUDGES = 3
 
 #: Phrases announcing work not yet done. Required to co-occur with an editing
 #: word, so "I should note that this returns None" in an answer to a read-only
@@ -347,6 +360,9 @@ INTENT_PHRASES = (
     "let's ",
     "i plan to",
     "i intend to",
+    "i need to",
+    "i must ",
+    "we need to",
     "next, i",
     "my plan",
     "here's my plan",
@@ -414,6 +430,20 @@ CLAIM_PHRASES = (
 #: "i'll", "let's" or "here's my plan" could ever match.
 APOSTROPHES = str.maketrans({"’": "'", "‘": "'", "ʼ": "'", "´": "'"})
 
+# The strict policy still needs an honest escape hatch. A model that inspected
+# the target and concluded that changing code would be wrong may say so
+# explicitly; analysis, an apology, or another future-tense plan is not enough.
+NO_CHANGE_PHRASES = (
+    "no code change is needed",
+    "no change is needed",
+    "no change is warranted",
+    "nothing worth changing",
+    "nothing to change",
+    "changed nothing",
+    "should not change the code",
+    "should not modify the code",
+)
+
 
 def _describes_work_that_did_not_happen(text: str) -> str | None:
     """``"claim"``, ``"plan"``, or ``None``.
@@ -435,6 +465,12 @@ def _describes_work_that_did_not_happen(text: str) -> str | None:
     return None
 
 
+def _explicitly_declines_a_change(text: str) -> bool:
+    """Whether a strict edit attempt deliberately concludes with no change."""
+    body = " ".join((text or "").lower().translate(APOSTROPHES).split())
+    return any(phrase in body for phrase in NO_CHANGE_PHRASES)
+
+
 def _act_on_your_plan_guidance(kind: str) -> str:
     """What the model is told when it narrates instead of acting."""
     opening = (
@@ -444,17 +480,30 @@ def _act_on_your_plan_guidance(kind: str) -> str:
         "and neither does describing the change. The edit you summarised does "
         "not exist."
         if kind == "claim"
-        else "You described what you were going to do, but no editing tool has "
-        "run in this session — `edit_file` and `write_file` have not been "
-        "called successfully even once — so none of it has happened yet."
+        else (
+            "You described what you were going to do, but no editing tool has "
+            "run in this session — `edit_file` and `write_file` have not been "
+            "called successfully even once — so none of it has happened yet."
+            if kind == "plan"
+            else "This is a code-change attempt, but your reply ended without a "
+            "successful `edit_file` or `write_file` call. Analysis and apologies "
+            "are not a result; either act on the analysis or explicitly conclude "
+            "that no code change is warranted."
+        )
     )
     return (
         f"{opening}\n\n"
-        "Make the edit now as a tool call. If you need to see the exact text "
-        "first, read the file, then call `edit_file` with the old and new text.\n\n"
+        "Do not explain this message. Your next reply should be a tool call. "
+        "For this provider the exact syntax is:\n\n"
+        "```tool_call\n"
+        '{"name": "read_file", "arguments": {"path": "the/real/path.py"}}\n'
+        "```\n\n"
+        "Substitute the real path. If you already know the exact text, call "
+        "`edit_file` instead with `path`, `old_string`, and `new_string`.\n\n"
         "If you have genuinely concluded there is nothing worth changing, say so "
-        "plainly and explain why — that is a valid outcome and it will be "
-        "recorded. What is not useful is a change that exists only in prose."
+        "using the exact words `no code change is warranted` and explain why. "
+        "That is a valid outcome and it will be recorded. What is not useful is "
+        "a change that exists only in prose."
     )
 
 

@@ -30,7 +30,13 @@ from morph.llm import get_provider
 from morph.trace import EventLog, ProgressFile, TraceRenderer
 
 from .guard import violations
-from .prompts import SYSTEM_PROMPT, append_history, build_improvement_prompt, load_history
+from .prompts import (
+    SYSTEM_PROMPT,
+    append_history,
+    build_improvement_prompt,
+    load_history,
+    select_target,
+)
 from .release import cut_release
 
 log = logging.getLogger("selfimprove")
@@ -73,6 +79,7 @@ class Iteration:
     deltas: dict[str, Any] = field(default_factory=dict)
     version: str = ""
     tag: str = ""
+    target: str = ""
 
     def to_entry(self) -> dict[str, Any]:
         return {
@@ -91,6 +98,7 @@ class Iteration:
             "deltas": self.deltas,
             "version": self.version,
             "tag": self.tag,
+            "target": self.target,
         }
 
 
@@ -111,12 +119,16 @@ def _bench_config(root: Path, config: Config) -> Config:
     signal and no GPU.
     """
     provider = os.environ.get("MORPH_BENCH_PROVIDER") or config.provider
+    # A stochastic objective cannot distinguish improvement from sampling
+    # noise. The same commit scored 58.9 and 64.1 on consecutive scheduled
+    # runs at 0.2. Editing stays exploratory; measurement defaults to zero.
+    temperature = float(os.environ.get("MORPH_BENCH_TEMPERATURE", "0"))
     return Config(
         workspace=root,
         provider=provider,
         model=config.model,
         base_url=config.base_url,
-        temperature=config.temperature,
+        temperature=temperature,
         image_backend="stub",
     )
 
@@ -220,12 +232,15 @@ async def run_iteration(
 
     try:
         requirements = (repo / "REQUIREMENTS.md").read_text("utf-8")
+        target = select_target(baseline, history)
+        iteration.target = str((target or {}).get("name") or "")
         prompt = build_improvement_prompt(
             requirements=requirements,
             scorecard=baseline,
             feedback=baseline.get("feedback") or _feedback_from(baseline),
             history=history,
             focus=focus,
+            target=target,
         )
 
         # Morph improves Morph: the editing agent is this project's own agent (R-702).
@@ -239,6 +254,7 @@ async def run_iteration(
                 temperature=config.temperature,
             ),
             system_prompt=SYSTEM_PROMPT,
+            require_edit=True,
         )
         try:
             result = await _run_traced(
@@ -468,6 +484,7 @@ async def run_loop(
     focus: str | None = None,
     history_path: Path | None = None,
     keep_worktree: bool = False,
+    scorecard_path: Path | None = None,
 ) -> list[dict[str, Any]]:
     """Run ``iterations`` improvement cycles. Returns one history entry each."""
     repo = Path(repo or REPO_ROOT)
@@ -489,6 +506,9 @@ async def run_loop(
     tracer = TraceRenderer()
     tracer.header(f"baseline — {cfg.provider}/{cfg.model}")
     baseline = await measure(repo, cfg, progress=progress)
+    scorecard_file = Path(scorecard_path or (repo / "selfimprove" / "scorecard.json"))
+    scorecard_file.parent.mkdir(parents=True, exist_ok=True)
+    scorecard_file.write_text(json.dumps(baseline, indent=2), "utf-8")
     log.info("Baseline score: %.1f", baseline.get("composite", 0.0))
     tracer.note(f"baseline composite {baseline.get('composite', 0.0):.1f}")
 
@@ -522,6 +542,7 @@ async def run_loop(
         if iteration.accepted and not dry_run:
             progress.update(phase="measuring", activity="re-scoring after acceptance")
             baseline = await measure(repo, cfg, progress=progress)
+            scorecard_file.write_text(json.dumps(baseline, indent=2), "utf-8")
 
     progress.update(phase="done", activity=f"{sum(1 for e in entries if e['accepted'])}"
                     f"/{len(entries)} accepted")
@@ -566,7 +587,10 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     print(json.dumps(entries, indent=2, default=str))
-    return 0 if any(e["accepted"] for e in entries) else 1
+    # No accepted attempt is a normal completed run. Real exceptions still
+    # propagate and fail CI, so the workflow no longer needs a blanket
+    # ``|| true`` that also hid crashes.
+    return 0
 
 
 if __name__ == "__main__":

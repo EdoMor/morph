@@ -108,11 +108,6 @@ jobs:
           done
           ollama pull "${MORPH_MODEL}"
 
-      # Baseline is taken before anything is touched, so the run's net effect on
-      # main is measurable even across several iterations.
-      - name: Baseline score
-        run: python -m bench.runner --output baseline-scorecard.json | tee baseline.txt
-
       - name: Record the starting commit
         id: base
         run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
@@ -131,7 +126,7 @@ jobs:
         run: |
           ARGS=(--iterations "${ITERATIONS}" --provider "${MORPH_PROVIDER}" --model "${MORPH_MODEL}")
           if [ -n "${FOCUS}" ]; then ARGS+=(--focus "${FOCUS}"); fi
-          python -m selfimprove.loop "${ARGS[@]}" | tee loop-output.json || true
+          python -m selfimprove.loop "${ARGS[@]}" | tee loop-output.json
 
       # Stop it before the publish steps, then send the final state once more so
       # the page's last frame matches how the run actually ended.
@@ -158,18 +153,15 @@ jobs:
         if: steps.changed.outputs.count != '0'
         run: python -m pytest tests -q
 
-      - name: Final score
-        if: steps.changed.outputs.count != '0'
-        run: python -m bench.runner --output final-scorecard.json | tee final.txt
-
       - name: Refuse to publish a regression
         if: steps.changed.outputs.count != '0'
         run: |
           python - <<'PY'
           import json, sys
-          before = json.load(open("baseline-scorecard.json"))
-          after = json.load(open("final-scorecard.json"))
-          b, a = before["composite"], after["composite"]
+          attempts = json.load(open("loop-output.json"))
+          after = json.load(open("selfimprove/scorecard.json"))
+          b = attempts[0]["score_before"]
+          a = after["composite"]
           print(f"composite {b} -> {a}")
           if after.get("gated"):
               sys.exit("REFUSING: conformance gate is failing")
@@ -177,17 +169,13 @@ jobs:
               sys.exit(f"REFUSING: composite regressed across the run ({b} -> {a})")
           PY
 
-      # Committed alongside the history so the Pages dashboard has real data
-      # without re-running an 80-minute benchmark to draw a chart.
-      - name: Record the scorecard for the dashboard
-        if: steps.changed.outputs.count != '0'
-        run: cp final-scorecard.json selfimprove/scorecard.json
-
-      # Gate 3+4. Rebase onto whatever main is now, re-run the suite, push
-      # without force, retry the race.
-      - name: Publish to ${{ inputs.publish_branch || 'main' }}
+      # Persist rejected attempts too. Otherwise an all-rejected scheduled run
+      # disappears with its runner and Gemma repeats it tomorrow. The publisher
+      # commits history plus the real-model scorecard even when no edit passed.
+      # Gate 3+4 still rebase, re-run the suite, and never force-push.
+      - name: Publish run state to ${{ inputs.publish_branch || 'main' }}
         id: publish
-        if: steps.changed.outputs.count != '0' && inputs.dry_run != true
+        if: inputs.dry_run != true
         run: |
           python -m selfimprove.publish --branch "${PUBLISH_BRANCH}" --attempts 5 \
             --scorecard selfimprove/scorecard.json | tee publish-result.json
@@ -201,8 +189,8 @@ jobs:
           PY
 
       - name: Publish (dry run)
-        if: steps.changed.outputs.count != '0' && inputs.dry_run == true
-        run: python -m selfimprove.publish --branch "${PUBLISH_BRANCH}" --dry-run
+        if: inputs.dry_run == true
+        run: python -m selfimprove.publish --branch "${PUBLISH_BRANCH}" --dry-run --no-history
 
       - name: Summarise
         if: always()
@@ -211,7 +199,7 @@ jobs:
             echo
             echo '### Scorecard'
             echo '```'
-            cat final.txt 2>/dev/null || cat baseline.txt
+            python -c 'import json; d=json.load(open("selfimprove/scorecard.json")); print("real-model composite: {:.1f}/100".format(d["composite"])); [print("{:13} {:5.1f}/{:.0f}".format(n, c.get("points", 0), c.get("weight", 0))) for n,c in d.get("categories", {}).items()]'
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
@@ -221,14 +209,12 @@ jobs:
         with:
           name: selfimprove-run-${{ github.run_number }}
           path: |
-            baseline-scorecard.json
-            final-scorecard.json
-            baseline.txt
-            final.txt
             loop-output.json
             publish-result.json
             selfimprove/history.jsonl
             selfimprove/progress.json
+            selfimprove/scorecard.json
+            selfimprove/live-trace.jsonl
           if-no-files-found: warn
 
   # One downloadable, installable release per version the loop cut this run.

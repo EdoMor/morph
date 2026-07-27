@@ -22,6 +22,7 @@ from __future__ import annotations
 import argparse
 import ast
 import asyncio
+import json
 import shutil
 import subprocess
 import sys
@@ -199,6 +200,7 @@ async def run_task(task: Task, config: Config) -> tuple[CheckResult, dict[str, A
     workspace = Path(tempfile.mkdtemp(prefix="morph-bench-"))
     started = time.perf_counter()
     agent: Agent | None = None
+    result: Any = None
     try:
         task.materialise(workspace)
         agent = _build_agent(task, workspace, config)
@@ -213,6 +215,8 @@ async def run_task(task: Task, config: Config) -> tuple[CheckResult, dict[str, A
             grade = task.rubric.grade(TaskContext(root=workspace, result=result))
             score, detail = grade.score, grade.detail
             steps = result.steps
+            if score < 0.8:
+                detail = f"{detail}\n\n{_task_trace_digest(result)}"
 
     except asyncio.TimeoutError:
         score, detail, steps = 0.0, f"timed out after {task.budget_seconds:g}s", task.budget_steps
@@ -243,6 +247,30 @@ async def run_task(task: Task, config: Config) -> tuple[CheckResult, dict[str, A
         "score": score,
     }
     return check, timing
+
+
+def _task_trace_digest(result: Any, limit: int = 6) -> str:
+    """Summarise how the agent failed, not only what the fixture lacked."""
+    calls = list(getattr(result, "tool_calls", []) or [])
+    lines = ["Agent trace (synthetic workspace):"]
+    if not calls:
+        lines.append("- no tool call was executed")
+    for index, call in enumerate(calls[-limit:], start=max(1, len(calls) - limit + 1)):
+        arguments = json.dumps(
+            call.get("arguments") or {}, ensure_ascii=False, sort_keys=True
+        )
+        status = "ok" if call.get("ok") else "failed"
+        content = " ".join(str(call.get("content") or "").split())
+        lines.append(
+            f"- {index}. {call.get('tool', '?')} {status}; args={arguments[:240]}"
+            + (f"; result={content[:220]}" if content else "")
+        )
+    answer = " ".join(str(getattr(result, "text", "") or "").split())
+    if answer:
+        lines.append(
+            f"- final reply after {getattr(result, 'steps', 0)} steps: {answer[:400]}"
+        )
+    return "\n".join(lines)
 
 
 async def run_capability_suites(

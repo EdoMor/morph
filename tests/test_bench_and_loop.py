@@ -15,7 +15,7 @@ import pytest
 
 from bench.scorecard import WEIGHTS, CheckResult, Scorecard, compare
 from selfimprove.guard import is_protected, violations
-from selfimprove.prompts import build_improvement_prompt
+from selfimprove.prompts import build_improvement_prompt, select_target
 
 
 # ---------------------------------------------------------------------------
@@ -297,6 +297,89 @@ def test_prompt_history_is_ordered_newest_first():
         requirements="x", scorecard={"composite": 20.0, "categories": {}}, feedback="y", history=history
     )
     assert prompt.index("newest attempt") < prompt.index("oldest attempt")
+
+
+def test_target_rotates_away_from_a_recent_rejection():
+    targets = [
+        {"name": "coding/T2/fix-edge-case", "category": "coding", "score": 0.14},
+        {"name": "tool_use/T2/chain-tool-results", "category": "tool_use", "score": 0.4},
+    ]
+    history = [
+        {
+            "accepted": False,
+            "target": "coding/T2/fix-edge-case",
+            "summary": "Tried fix-edge-case and made no edit.",
+        }
+    ]
+
+    assert select_target({"next_targets": targets}, history) == targets[1]
+
+
+def test_prompt_gives_gemma_one_synthetic_target_and_a_first_action():
+    target = {
+        "name": "coding/T2/fix-edge-case",
+        "category": "coding",
+        "score": 0.14,
+        "detail": "average([]) raised ZeroDivisionError",
+    }
+    prompt = build_improvement_prompt(
+        requirements="R-001 something",
+        scorecard={"composite": 60.0, "categories": {}, "next_targets": [target]},
+        feedback="nearest miss",
+        history=[],
+    )
+
+    assert "work on this one only" in prompt
+    assert 'name="fix-edge-case"' in prompt
+    assert "bench/tasks/coding.py" in prompt
+    assert "evidence, not source code" in prompt
+
+
+def test_benchmark_temperature_defaults_to_zero(monkeypatch, tmp_path):
+    from morph.config import Config
+    from selfimprove.loop import _bench_config
+
+    monkeypatch.delenv("MORPH_BENCH_TEMPERATURE", raising=False)
+    measured = _bench_config(tmp_path, Config(workspace=tmp_path, temperature=0.2))
+    assert measured.temperature == 0.0
+
+    monkeypatch.setenv("MORPH_BENCH_TEMPERATURE", "0.1")
+    assert _bench_config(tmp_path, Config(workspace=tmp_path)).temperature == 0.1
+
+
+@pytest.mark.asyncio
+async def test_strict_edit_attempt_cannot_end_on_analysis(config, registry):
+    from morph.agent import Agent
+    from morph.llm.base import ModelResponse
+    from morph.llm.echo import EchoProvider
+
+    class AnalystThenEditor:
+        name = "analyst"
+        supports_native_tools = True
+
+        def __init__(self):
+            self.turns = []
+
+        async def complete(self, messages, tools=None, **kwargs):  # noqa: ANN001, ANN003
+            self.turns.append(list(messages))
+            if len(self.turns) == 1:
+                return ModelResponse(text="The likely cause is in the retry policy.")
+            if len(self.turns) == 2:
+                return EchoProvider.call("write_file", path="fix.txt", content="done\n")
+            return ModelResponse(text="Implemented and verified the change.")
+
+    provider = AnalystThenEditor()
+    agent = Agent(
+        config=config,
+        provider=provider,
+        tools=registry,
+        require_edit=True,
+    )
+    result = await agent.run("Make an improvement.", max_steps=8)
+
+    assert (config.root / "fix.txt").read_text("utf-8") == "done\n"
+    assert result.steps == 3
+    assert "code-change attempt" in json.dumps(provider.turns[1])
 
 
 # ---------------------------------------------------------------------------

@@ -5,7 +5,7 @@ See ``REQUIREMENTS.md`` for the contract this package implements.
 
 from __future__ import annotations
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 
 from .agent import Agent, AgentEvent, RunResult, run_once
 from .config import Config, MCPServerConfig, load_config

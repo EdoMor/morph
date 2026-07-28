@@ -8,6 +8,8 @@ name: self-improve
 # the conformance suite passes, no protected file was touched, and the composite
 # score did not regress (R-704, R-707). Accepted iterations are pushed to main
 # directly — no human in the loop (R-713).
+# Gemma's mutation step first generates and filters exact patch proposals; only
+# a controller-validated candidate reaches the benchmark (R-722).
 #
 # What stands between a bad idea and main:
 #   1. the iteration's own gate      — tests green, score held, goalposts intact

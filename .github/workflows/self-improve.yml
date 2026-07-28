@@ -19,6 +19,12 @@ name: self-improve
 # like `selfimprove/nightly` and merge by hand).
 
 on:
+  # A loop-workflow change should exercise the loop it changed. Restrict this
+  # push trigger to this file so bot history/version commits cannot recurse.
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/self-improve.yml"
   schedule:
     - cron: "17 3 * * *" # 03:17 UTC daily
   workflow_dispatch:

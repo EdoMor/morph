@@ -83,6 +83,132 @@ function drawChart(series) {
   }
 }
 
+function drawRadar(data) {
+  const card = $("#radar-card");
+  const chart = $("#radar");
+  const axes = data?.axes || [];
+  if (axes.length < 3) {
+    card.hidden = true;
+    return;
+  }
+
+  card.hidden = false;
+  chart.textContent = "";
+
+  const W = 620, H = 460, cx = 310, cy = 214, radius = 154;
+  const angle = (index) => -Math.PI / 2 + (index / axes.length) * Math.PI * 2;
+  const point = (index, percent, extra = 0) => {
+    const distance = radius * Math.max(0, Math.min(100, percent)) / 100 + extra;
+    return [
+      cx + Math.cos(angle(index)) * distance,
+      cy + Math.sin(angle(index)) * distance,
+    ];
+  };
+  const points = (field, fallback = 0) => axes
+    .map((axis, index) => point(index, axis[field] ?? fallback).join(","))
+    .join(" ");
+
+  const title = svg("title", { id: "radar-title" });
+  title.textContent = "Benchmark performance by category";
+  chart.appendChild(title);
+  const desc = svg("desc", { id: "radar-desc" });
+  desc.textContent =
+    `Current composite ${Number(data.current_composite ?? 0).toFixed(1)} out of 100` +
+    (data.previous_composite != null
+      ? `, compared with ${Number(data.previous_composite).toFixed(1)} in the previous run.`
+      : ".");
+  chart.appendChild(desc);
+
+  for (const percent of [25, 50, 75, 100]) {
+    chart.appendChild(svg("polygon", {
+      class: "radar-grid",
+      points: axes.map((_, index) => point(index, percent).join(",")).join(" "),
+    }));
+    const [x, y] = point(0, percent);
+    const ringLabel = svg("text", {
+      class: "radar-ring-label", x: x + 5, y: y + 11,
+    });
+    ringLabel.textContent = percent;
+    chart.appendChild(ringLabel);
+  }
+
+  axes.forEach((axis, index) => {
+    const [x, y] = point(index, 100);
+    chart.appendChild(svg("line", {
+      class: "radar-spoke", x1: cx, y1: cy, x2: x, y2: y,
+    }));
+
+    const [labelX, labelY] = point(index, 100, 42);
+    const cosine = Math.cos(angle(index));
+    const label = svg("text", {
+      class: "radar-axis-label",
+      x: labelX,
+      y: labelY - 5,
+      "text-anchor": cosine > 0.2 ? "start" : cosine < -0.2 ? "end" : "middle",
+    });
+    const name = svg("tspan", { x: labelX });
+    name.textContent = axis.label;
+    label.appendChild(name);
+    const value = svg("tspan", { x: labelX, dy: 17, class: "radar-axis-value" });
+    value.textContent =
+      `${Number(axis.current).toFixed(0)}%` +
+      (axis.delta != null ? ` · ${axis.delta >= 0 ? "+" : ""}${Number(axis.delta).toFixed(1)}` : "");
+    label.appendChild(value);
+    chart.appendChild(label);
+  });
+
+  const hasPrevious = axes.some((axis) => axis.previous != null);
+  if (hasPrevious) {
+    chart.appendChild(svg("polygon", {
+      class: "radar-shape previous", points: points("previous"),
+    }));
+  }
+  chart.appendChild(svg("polygon", {
+    class: "radar-shape current", points: points("current"),
+  }));
+  axes.forEach((axis, index) => {
+    const [x, y] = point(index, axis.current);
+    const dot = svg("circle", { class: "radar-dot", cx: x, cy: y, r: 4 });
+    const tip = svg("title");
+    tip.textContent =
+      `${axis.label}: ${Number(axis.current).toFixed(1)}%` +
+      (axis.previous != null
+        ? `, previous ${Number(axis.previous).toFixed(1)}%, change ${axis.delta >= 0 ? "+" : ""}${Number(axis.delta).toFixed(1)}`
+        : "");
+    dot.appendChild(tip);
+    chart.appendChild(dot);
+  });
+
+  $("#radar-current-label").textContent =
+    `${data.current_label || "Current run"} · ${Number(data.current_composite ?? 0).toFixed(1)}`;
+  $("#radar-previous-label").textContent =
+    `${data.previous_label || "Previous run"} · ${Number(data.previous_composite ?? 0).toFixed(1)}`;
+  $("#radar-previous-key").hidden = !hasPrevious;
+
+  const composite = data.composite_delta;
+  const compositeHost = $("#radar-composite-delta");
+  compositeHost.textContent = composite == null
+    ? "First measured run"
+    : `${composite >= 0 ? "+" : ""}${Number(composite).toFixed(2)} points`;
+  compositeHost.className =
+    composite == null ? "flat" : composite > 0.001 ? "up" : composite < -0.001 ? "down" : "flat";
+
+  const deltas = $("#radar-deltas");
+  deltas.textContent = "";
+  axes.forEach((axis) => {
+    const item = el("li");
+    item.appendChild(el("span", "radar-delta-label", axis.label));
+    const change = axis.delta;
+    const klass = change == null ? "flat" : change > 0.001 ? "up" : change < -0.001 ? "down" : "flat";
+    item.appendChild(el(
+      "span",
+      `radar-delta-value ${klass}`,
+      change == null ? "—" : `${change >= 0 ? "+" : ""}${Number(change).toFixed(1)} pts`,
+    ));
+    deltas.appendChild(item);
+  });
+}
+
 /* -------------------------------------------------------------- sections */
 
 function drawCategories(scorecard) {
@@ -261,6 +387,7 @@ function render(data) {
   $("#content").hidden = false;
 
   drawChart(data.series || []);
+  drawRadar(data.radar);
   drawCategories(scorecard);
   drawTiers(scorecard);
   drawWarnings(scorecard);

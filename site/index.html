@@ -83,6 +83,35 @@
     </section>
 
     <!-- ---------------------------------------------------------------- -->
+    <section class="card radar-card" id="radar-card" hidden>
+      <div class="card-head">
+        <h2>Benchmark shape</h2>
+        <p class="hint">Each axis is a benchmark category normalised to 100%.
+          The overlap compares this completed run with the previous run, so
+          improvement and regression are visible even when the composite barely moves.</p>
+      </div>
+      <div class="radar-layout">
+        <div class="radar-figure">
+          <svg id="radar" viewBox="0 0 620 460" role="img" aria-labelledby="radar-title radar-desc">
+            <title id="radar-title">Benchmark performance by category</title>
+            <desc id="radar-desc">Radar chart comparing current benchmark percentages with the previous loop run.</desc>
+          </svg>
+          <div class="radar-legend" aria-hidden="true">
+            <span><i class="legend-swatch current"></i><span id="radar-current-label">Current run</span></span>
+            <span id="radar-previous-key"><i class="legend-swatch previous"></i><span id="radar-previous-label">Previous run</span></span>
+          </div>
+        </div>
+        <div class="radar-summary">
+          <div class="radar-composite">
+            <span class="eyebrow">Composite change</span>
+            <strong id="radar-composite-delta">—</strong>
+          </div>
+          <ul id="radar-deltas" class="radar-deltas"></ul>
+        </div>
+      </div>
+    </section>
+
+    <!-- ---------------------------------------------------------------- -->
     <div class="grid">
       <section class="card">
         <div class="card-head">

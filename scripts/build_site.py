@@ -26,6 +26,7 @@ from typing import Any
 REPO_ROOT = Path(__file__).resolve().parent.parent
 HISTORY = Path("selfimprove/history.jsonl")
 SCORECARD = Path("selfimprove/scorecard.json")
+PREVIOUS_SCORECARD = Path("selfimprove/previous-scorecard.json")
 CHANGELOG = Path("CHANGELOG.md")
 VERSION_RE = re.compile(r'__version__ = "(\d+\.\d+\.\d+)"')
 
@@ -52,8 +53,8 @@ def read_history(repo: Path) -> list[dict[str, Any]]:
     return entries
 
 
-def read_scorecard(repo: Path) -> dict[str, Any]:
-    path = repo / SCORECARD
+def read_scorecard(repo: Path, relative_path: Path = SCORECARD) -> dict[str, Any]:
+    path = repo / relative_path
     if not path.is_file():
         return {}
     try:
@@ -106,6 +107,67 @@ def score_series(history: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return series
 
 
+def radar_comparison(
+    current: dict[str, Any], previous: dict[str, Any]
+) -> dict[str, Any] | None:
+    """Normalised category performance for the current and previous loop run.
+
+    Categories have different weights, so plotting raw points would make the
+    requirements axis look artificially dominant. Every radar axis is instead
+    expressed as a percentage of the category's available points.
+    """
+    categories = current.get("categories") or {}
+    if not categories:
+        return None
+
+    old_categories = previous.get("categories") or {}
+    axes = []
+    for name, category in categories.items():
+        weight = float(category.get("weight") or 0)
+        current_percent = (
+            float(category.get("score")) * 100
+            if category.get("score") is not None
+            else (float(category.get("points") or 0) / weight * 100 if weight else 0)
+        )
+
+        old = old_categories.get(name)
+        previous_percent = None
+        if old:
+            old_weight = float(old.get("weight") or 0)
+            previous_percent = (
+                float(old.get("score")) * 100
+                if old.get("score") is not None
+                else (float(old.get("points") or 0) / old_weight * 100 if old_weight else 0)
+            )
+
+        axes.append(
+            {
+                "key": name,
+                "label": name.replace("_", " "),
+                "current": round(current_percent, 2),
+                "previous": round(previous_percent, 2)
+                if previous_percent is not None
+                else None,
+                "delta": round(current_percent - previous_percent, 2)
+                if previous_percent is not None
+                else None,
+            }
+        )
+
+    current_composite = current.get("composite")
+    previous_composite = previous.get("composite")
+    return {
+        "current_label": "Current run",
+        "previous_label": "Previous run",
+        "current_composite": current_composite,
+        "previous_composite": previous_composite,
+        "composite_delta": round(current_composite - previous_composite, 2)
+        if current_composite is not None and previous_composite is not None
+        else None,
+        "axes": axes,
+    }
+
+
 def summarise(history: list[dict[str, Any]]) -> dict[str, Any]:
     accepted = [e for e in history if e.get("accepted")]
     rejected = [e for e in history if not e.get("accepted")]
@@ -153,6 +215,7 @@ def repo_url(repo: Path) -> str:
 def build(repo: Path = REPO_ROOT) -> dict[str, Any]:
     history = read_history(repo)
     scorecard = read_scorecard(repo)
+    previous_scorecard = read_scorecard(repo, PREVIOUS_SCORECARD)
 
     return {
         "generated_at": time.time(),
@@ -172,6 +235,7 @@ def build(repo: Path = REPO_ROOT) -> dict[str, Any]:
         else None,
         "summary": summarise(history),
         "series": score_series(history),
+        "radar": radar_comparison(scorecard, previous_scorecard),
         "history": list(reversed(history))[:60],  # newest first
         "releases": releases(repo)[:20],
     }

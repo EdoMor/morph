@@ -19,6 +19,7 @@ on:
       - "scripts/build_site.py"
       - "selfimprove/history.jsonl"
       - "selfimprove/scorecard.json"
+      - "selfimprove/previous-scorecard.json"
       - "CHANGELOG.md"
       - ".github/workflows/pages.yml"
 

@@ -39,7 +39,11 @@ jobs:
 
       - name: Benchmark
         if: matrix.python-version == '3.11'
-        run: python -m bench.runner --output scorecard.json
+        # CI validates the harness without a model server. Real Gemma capability
+        # is measured by the self-improvement workflow after it starts Ollama.
+        run: >-
+          python -m bench.runner --provider echo --model echo
+          --image-backend stub --output scorecard.json
 
       - name: Upload scorecard
         if: matrix.python-version == '3.11'

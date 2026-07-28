@@ -1352,6 +1352,10 @@ def test_R_802_no_paid_api_required(repo_root):
     assert build_default_registry(config)
     assert get_provider("echo")
 
+    ci = (repo_root / ".github" / "workflows" / "ci.yml").read_text("utf-8")
+    assert "--provider echo" in ci
+    assert "--image-backend stub" in ci
+
 
 def test_R_803_secrets_come_from_the_environment_only(repo_root):
     """R-803: no key is written to disk, logged, or committed."""
@@ -1730,6 +1734,10 @@ def test_R_717_build_site_summarises_real_history(tmp_path):
                     "categories": {"coding": {"points": 10.0, "weight": 20}},
                     "diagnostics": {"coding": {"frontier": 2, "calibration": "healthy"}}})
     )
+    (repo / "selfimprove" / "previous-scorecard.json").write_text(
+        json.dumps({"composite": 60.0,
+                    "categories": {"coding": {"points": 8.0, "weight": 20}}})
+    )
 
     data = build(repo)
 
@@ -1742,6 +1750,16 @@ def test_R_717_build_site_summarises_real_history(tmp_path):
     assert "score regressed" in reasons
     assert len(data["series"]) == 3
     assert data["history"][0]["accepted"] is True, "newest first"
+    assert data["radar"]["composite_delta"] == 4.0
+    assert data["radar"]["axes"] == [
+        {
+            "key": "coding",
+            "label": "coding",
+            "current": 50.0,
+            "previous": 40.0,
+            "delta": 10.0,
+        }
+    ]
 
 
 def test_R_717_pages_workflow_deploys_and_is_callable(repo_root):
@@ -1760,6 +1778,45 @@ def test_R_717_pages_workflow_deploys_and_is_callable(repo_root):
     improve = (repo_root / ".github" / "workflows" / "self-improve.yml").read_text("utf-8")
     assert "pages.yml" in improve
     assert "selfimprove/scorecard.json" in improve
+    assert "selfimprove/previous-scorecard.json" in improve
+
+
+def test_R_717_dashboard_keeps_consecutive_scorecards(repo_root):
+    """The radar needs two real measurements, not a delta inferred from history."""
+    ignore = (repo_root / ".gitignore").read_text("utf-8")
+    workflow = (repo_root / ".github" / "workflows" / "self-improve.yml").read_text("utf-8")
+    app = (repo_root / "site" / "app.js").read_text("utf-8")
+
+    assert "!selfimprove/scorecard.json" in ignore
+    assert "!selfimprove/previous-scorecard.json" in ignore
+    assert "--scorecard selfimprove/previous-scorecard.json" in workflow
+    assert "drawRadar" in app
+
+
+async def test_R_717_loop_rotates_the_previous_scorecard(tmp_path, monkeypatch):
+    """A new baseline must preserve the preceding run's exact measurement."""
+    from selfimprove import loop
+
+    repo = tmp_path / "repo"
+    (repo / "selfimprove").mkdir(parents=True)
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    current = repo / "selfimprove" / "scorecard.json"
+    previous = repo / "selfimprove" / "previous-scorecard.json"
+    current.write_text(json.dumps({"composite": 62.0}), "utf-8")
+
+    async def fake_measure(*_args, **_kwargs):
+        return {"composite": 64.0, "categories": {}}
+
+    monkeypatch.setattr(loop, "measure", fake_measure)
+    await loop.run_loop(
+        config=Config(workspace=repo, provider="echo"),
+        iterations=0,
+        repo=repo,
+        history_path=repo / "selfimprove" / "history.jsonl",
+    )
+
+    assert json.loads(previous.read_text("utf-8"))["composite"] == 62.0
+    assert json.loads(current.read_text("utf-8"))["composite"] == 64.0
 
 
 # ---------------------------------------------------------------------------

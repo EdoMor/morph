@@ -184,7 +184,8 @@ jobs:
         if: inputs.dry_run != true
         run: |
           python -m selfimprove.publish --branch "${PUBLISH_BRANCH}" --attempts 5 \
-            --scorecard selfimprove/scorecard.json | tee publish-result.json
+            --scorecard selfimprove/scorecard.json \
+            --scorecard selfimprove/previous-scorecard.json | tee publish-result.json
           # Tags are created by publishing, after any rebase settled the SHAs.
           python - <<'PY' >> "$GITHUB_OUTPUT"
           import json, pathlib
@@ -220,6 +221,7 @@ jobs:
             selfimprove/history.jsonl
             selfimprove/progress.json
             selfimprove/scorecard.json
+            selfimprove/previous-scorecard.json
             selfimprove/live-trace.jsonl
           if-no-files-found: warn
 

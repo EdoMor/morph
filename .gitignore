@@ -19,6 +19,10 @@ baseline-scorecard.json
 final-scorecard.json
 loop-output.json
 
+# The loop's two dashboard snapshots are durable state, not scratch output.
+!selfimprove/scorecard.json
+!selfimprove/previous-scorecard.json
+
 .DS_Store
 *.swp
 .idea/

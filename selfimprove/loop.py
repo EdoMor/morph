@@ -786,10 +786,21 @@ async def run_loop(
     )
     progress.update(phase="baseline", activity="scoring the current code", iterations=iterations)
 
+    scorecard_file = Path(
+        scorecard_path or (repo / "selfimprove" / "scorecard.json")
+    )
+    previous_scorecard_file = (
+        repo / "selfimprove" / "previous-scorecard.json"
+        if scorecard_path is None
+        else scorecard_file.with_name("previous-" + scorecard_file.name)
+    )
+    if scorecard_file.is_file():
+        previous_scorecard_file.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(scorecard_file, previous_scorecard_file)
+
     tracer = TraceRenderer()
     tracer.header(f"baseline — {cfg.provider}/{cfg.model}")
     baseline = await measure(repo, cfg, progress=progress)
-    scorecard_file = Path(scorecard_path or (repo / "selfimprove" / "scorecard.json"))
     scorecard_file.parent.mkdir(parents=True, exist_ok=True)
     scorecard_file.write_text(json.dumps(baseline, indent=2), "utf-8")
     log.info("Baseline score: %.1f", baseline.get("composite", 0.0))

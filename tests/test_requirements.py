@@ -846,6 +846,18 @@ def test_R_705_history_is_recorded_and_fed_back(tmp_path):
     entries = load_history(history_file)
     assert len(entries) == 1
     assert entries[0]["accepted"] is False
+    experience = entries[0]["experience"]
+    for field in (
+        "target",
+        "hypothesis",
+        "approach",
+        "evidence",
+        "outcome",
+        "lesson",
+        "retry_condition",
+        "approach_fingerprint",
+    ):
+        assert field in experience
 
     prompt = build_improvement_prompt(
         requirements="R-000 do a thing",
@@ -856,6 +868,8 @@ def test_R_705_history_is_recorded_and_fed_back(tmp_path):
     assert "Tried caching the tool registry." in prompt
     assert "REJECTED" in prompt
     assert "score regressed" in prompt
+    assert "Experience memory" in prompt
+    assert "retry only if" in prompt
 
 
 def test_R_706_loop_runs_unattended_in_ci(repo_root):

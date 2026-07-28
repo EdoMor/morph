@@ -181,8 +181,14 @@ user controls — including a phone.
   recorded as a failed attempt.
 - **R-705** — Every iteration appends to `selfimprove/history.jsonl`: timestamp,
   base commit, score before/after, per-category deltas, accepted/rejected, and
-  the model's stated rationale. The history is fed back into the next prompt so
-  the model does not repeat a failed approach.
+  the model's stated rationale. Each row also carries a structured experience:
+  target, causal hypothesis, attempted approach and files, evaluator evidence,
+  outcome, reusable lesson, retry condition, and a fingerprint of the resulting
+  code state. Planning retrieves all history relevant to the chosen target —
+  not merely a recent fixed-size window — and distinguishes verified successes,
+  rejected approaches, and later-invalidated false positives. An identical
+  rejected code state is not benchmarked again unless the relevant baseline has
+  changed.
 - **R-706** — The loop runs unattended on GitHub Codespaces / GitHub Actions and
   is safe to run on a schedule.
 - **R-713** — Accepted iterations are **published to the default branch

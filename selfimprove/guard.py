@@ -23,6 +23,8 @@ PROTECTED: tuple[str, ...] = (
     "bench/tasks",
     "selfimprove/guard.py",
     "selfimprove/loop.py",
+    "selfimprove/memory.py",
+    "selfimprove/history.jsonl",
     ".github/workflows/self-improve.yml",
 )
 

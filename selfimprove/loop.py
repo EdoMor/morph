@@ -12,6 +12,7 @@ PROTECTED FILE — the loop may not modify this (R-707).
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -32,6 +33,7 @@ from morph.tools import ToolRegistry, build_default_registry
 from morph.trace import EventLog, ProgressFile, TraceRenderer
 
 from .guard import violations
+from .memory import repeated_rejected_change
 from .prompts import (
     DIAGNOSIS_SYSTEM_PROMPT,
     SYSTEM_PROMPT,
@@ -91,6 +93,7 @@ class Iteration:
     target_score_before: float | None = None
     target_score_after: float | None = None
     tool_failures: list[str] = field(default_factory=list)
+    change_fingerprint: str = ""
     measurement_after: dict[str, Any] | None = field(default=None, repr=False)
 
     def to_entry(self) -> dict[str, Any]:
@@ -115,6 +118,7 @@ class Iteration:
             "target_score_before": self.target_score_before,
             "target_score_after": self.target_score_after,
             "tool_failures": self.tool_failures,
+            "change_fingerprint": self.change_fingerprint,
         }
 
 
@@ -462,7 +466,9 @@ async def run_iteration(
             diagnosis = (diagnosis_result.text or "").strip()
             iteration.diagnosis = diagnosis[:3000]
 
-        prompt = build_implementation_prompt(target, diagnosis, focus=focus)
+        prompt = build_implementation_prompt(
+            target, diagnosis, history=history, focus=focus
+        )
         tracer.header(f"implementation — {iteration.target or 'fallback'}")
         progress.update(phase="editing", activity="implementing the diagnosis")
 
@@ -520,6 +526,9 @@ async def run_iteration(
             iteration.rejection_reason = "the agent made no changes"
             iteration.score_after = iteration.score_before
             return iteration
+        iteration.change_fingerprint = _change_fingerprint(
+            worktree, iteration.files_changed
+        )
 
         # R-707: touching the goalposts rejects the whole iteration.
         breached = violations(worktree, base_commit)
@@ -539,11 +548,31 @@ async def run_iteration(
             iteration.score_after = iteration.score_before
             return iteration
 
+        if iteration.target and _is_capability_target(iteration.target):
+            iteration.target_score_before = _score_for(baseline, iteration.target)
+        current_metric = (
+            iteration.target_score_before
+            if iteration.target_score_before is not None
+            else iteration.score_before
+        )
+        duplicate = repeated_rejected_change(
+            history,
+            target=iteration.target,
+            change_fingerprint=iteration.change_fingerprint,
+            current_metric=current_metric,
+        )
+        if duplicate:
+            iteration.rejection_reason = (
+                f"repeated rejected change {duplicate['id']}; retry condition not met: "
+                f"{duplicate['retry_condition']}"
+            )
+            iteration.score_after = iteration.score_before
+            return iteration
+
         # Cheap selection stage: a candidate must improve the exact task it was
         # designed for before spending another hour on a full sweep. This also
         # stops unrelated edits from winning on benchmark sampling noise.
         if iteration.target and _is_capability_target(iteration.target):
-            iteration.target_score_before = _score_for(baseline, iteration.target)
             tracer.note(f"preflight: re-running {iteration.target}")
             progress.update(
                 phase="measuring",
@@ -671,6 +700,23 @@ def _changed(worktree: Path, base: str) -> list[str]:
     return sorted(
         {line.strip() for line in f"{tracked}\n{untracked}".splitlines() if line.strip()}
     )
+
+
+def _change_fingerprint(worktree: Path, files: list[str]) -> str:
+    """Hash the candidate's final touched-file state for exact-repeat detection."""
+    digest = hashlib.sha256()
+    for relative in sorted(files):
+        path = worktree / relative
+        digest.update(relative.encode("utf-8"))
+        digest.update(b"\0")
+        if path.is_symlink():
+            digest.update(os.readlink(path).encode("utf-8"))
+        elif path.is_file():
+            digest.update(path.read_bytes())
+        else:
+            digest.update(b"<deleted>")
+        digest.update(b"\0")
+    return digest.hexdigest()[:20]
 
 
 def _commit_and_merge(repo: Path, worktree: Path, branch: str, iteration: Iteration) -> None:

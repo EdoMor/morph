@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any
 
 from .guard import guard_prompt_section
+from .memory import enrich_entry, render_experience_memory, target_stats
 
 SYSTEM_PROMPT = """\
 You are Gemma, working on Morph — a self-hosted coding agent platform. You are
@@ -114,24 +115,38 @@ def select_target(
         if capability:
             targets = capability
 
-    recent = list(reversed(history))[:8]
-    attempted = {
-        str(entry.get("target"))
-        for entry in recent
-        if entry.get("target")
-    }
-    rejected_text = " ".join(
-        str(entry.get("summary") or "") + " " + str(entry.get("rejection_reason") or "")
-        for entry in recent
-        if not entry.get("accepted")
-    ).lower()
-
+    # Explore every target once before revisiting any of them. Unlike the old
+    # eight-row window, this remains true across scheduled runs and a long
+    # archive.
     for target in targets:
         name = str(target.get("name") or "")
-        leaf = name.rsplit("/", 1)[-1]
-        if name not in attempted and leaf.lower() not in rejected_text:
+        if target_stats(history, name)["attempts"] == 0:
             return target
-    return targets[0]
+
+    # A changed exact-target baseline is new evidence and justifies an earlier
+    # retry. Otherwise prefer the target with the fewest consecutive failures,
+    # then the one left alone longest. The original target order breaks ties,
+    # preserving the scorecard's nearest-miss preference.
+    for target in targets:
+        name = str(target.get("name") or "")
+        stats = target_stats(history, name)
+        previous = stats.get("last_target_score")
+        if isinstance(previous, (int, float)) and abs(
+            float(target.get("score") or 0) - float(previous)
+        ) > 0.005:
+            return target
+
+    ranked = sorted(
+        enumerate(targets),
+        key=lambda pair: (
+            target_stats(history, str(pair[1].get("name") or ""))[
+                "consecutive_failures"
+            ],
+            target_stats(history, str(pair[1].get("name") or ""))["last_index"],
+            pair[0],
+        ),
+    )
+    return ranked[0][1]
 
 
 def _target_brief(target: dict[str, Any] | None) -> str:
@@ -254,7 +269,7 @@ def build_diagnosis_prompt(
     """Small read-only prompt for the archive/diagnosis stage."""
     sections = [_task_dossier(target)]
     if history:
-        sections.append(_render_history(history, limit=4))
+        sections.append(render_experience_memory(history, target))
     if focus:
         sections.append(f"# Human focus\n\n{focus}")
     sections.append(
@@ -269,6 +284,7 @@ def build_diagnosis_prompt(
 def build_implementation_prompt(
     target: dict[str, Any] | None,
     diagnosis: str,
+    history: list[dict[str, Any]] | None = None,
     focus: str | None = None,
 ) -> str:
     """Focused fresh-context prompt for the code-writing stage."""
@@ -279,6 +295,7 @@ def build_implementation_prompt(
             "# Diagnosis handoff\n\n"
             f"{diagnosis.strip()[:5000] or 'The diagnosis stage produced no usable handoff.'}"
         ),
+        render_experience_memory(history or [], target),
         guard_prompt_section(),
         (
             "# Working rules\n\n"
@@ -397,7 +414,7 @@ def build_improvement_prompt(
     sections.append(f"## What is failing\n\n{feedback}")
 
     if history:
-        sections.append(_render_history(history))
+        sections.append(render_experience_memory(history, chosen))
 
     sections.append(f"## The requirements (the contract)\n\n{requirements}")
     sections.append(guard_prompt_section())
@@ -415,32 +432,7 @@ def build_improvement_prompt(
     return "\n\n---\n\n".join(sections)
 
 
-def _render_history(history: list[dict[str, Any]], limit: int = 8) -> str:
-    """Recent attempts, newest first — so the model stops repeating itself."""
-    lines = [
-        "## Previous attempts",
-        "",
-        "Do not repeat a rejected approach. If an approach was rejected twice, the",
-        "problem is upstream of where you were looking.",
-        "",
-    ]
-    for entry in list(reversed(history))[:limit]:
-        verdict = "ACCEPTED" if entry.get("accepted") else "REJECTED"
-        delta = entry.get("score_after", 0) - entry.get("score_before", 0)
-        target = f" [{entry['target']}]" if entry.get("target") else ""
-        lines.append(
-            f"- **{verdict}** ({entry.get('score_before', 0):.1f} → "
-            f"{entry.get('score_after', 0):.1f}, {delta:+.1f}){target} — "
-            f"{(entry.get('summary') or '(no summary)').strip()[:300]}"
-        )
-        if entry.get("rejection_reason"):
-            lines.append(f"  - rejected because: {entry['rejection_reason']}")
-        if entry.get("files_changed"):
-            lines.append(f"  - touched: {', '.join(entry['files_changed'][:8])}")
-    return "\n".join(lines)
-
-
-def load_history(path: Path, limit: int = 50) -> list[dict[str, Any]]:
+def load_history(path: Path, limit: int | None = None) -> list[dict[str, Any]]:
     if not path.is_file():
         return []
     entries: list[dict[str, Any]] = []
@@ -448,13 +440,15 @@ def load_history(path: Path, limit: int = 50) -> list[dict[str, Any]]:
         if not line.strip():
             continue
         try:
-            entries.append(json.loads(line))
+            entries.append(enrich_entry(json.loads(line)))
         except json.JSONDecodeError:
             continue
-    return entries[-limit:]
+    return entries[-limit:] if limit is not None else entries
 
 
 def append_history(path: Path, entry: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
+    enriched = enrich_entry(entry)
+    entry["experience"] = enriched["experience"]
     with path.open("a", encoding="utf-8") as handle:
-        handle.write(json.dumps(entry, ensure_ascii=False, default=str) + "\n")
+        handle.write(json.dumps(enriched, ensure_ascii=False, default=str) + "\n")

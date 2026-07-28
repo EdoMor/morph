@@ -15,10 +15,18 @@ import pytest
 
 from bench.scorecard import WEIGHTS, CheckResult, Scorecard, compare
 from selfimprove.guard import is_protected, violations
+from selfimprove.memory import (
+    enrich_entry,
+    render_experience_memory,
+    repeated_rejected_change,
+    target_stats,
+)
 from selfimprove.prompts import (
+    append_history,
     build_diagnosis_prompt,
     build_implementation_prompt,
     build_improvement_prompt,
+    load_history,
     select_target,
 )
 
@@ -216,6 +224,8 @@ def test_feedback_when_everything_passes_asks_for_harder_tasks():
         "bench/runner.py",
         "selfimprove/loop.py",
         "selfimprove/guard.py",
+        "selfimprove/memory.py",
+        "selfimprove/history.jsonl",
         ".github/workflows/self-improve.yml",
     ],
 )
@@ -340,6 +350,61 @@ def test_target_rotates_away_from_a_recent_rejection():
     assert select_target({"next_targets": targets}, history) == targets[1]
 
 
+def test_target_memory_does_not_forget_attempts_outside_a_recent_window():
+    targets = [
+        {"name": "coding/T2/fix-edge-case", "category": "coding", "score": 0.14},
+        {"name": "tool_use/T2/chain-tool-results", "category": "tool_use", "score": 0.4},
+    ]
+    history = [
+        {"accepted": False, "target": "coding/T2/fix-edge-case", "summary": "old failure"},
+        *[
+            {"accepted": False, "target": f"skills/T{i}/other", "summary": "noise"}
+            for i in range(12)
+        ],
+    ]
+
+    assert select_target({"next_targets": targets}, history) == targets[1]
+
+
+def test_history_loader_keeps_the_complete_archive_by_default(tmp_path: Path):
+    path = tmp_path / "history.jsonl"
+    for iteration in range(60):
+        append_history(path, {"iteration": iteration, "accepted": False})
+
+    assert len(load_history(path)) == 60
+    assert len(load_history(path, limit=8)) == 8
+
+
+def test_target_selection_prefers_fewer_consecutive_failures_after_exploration():
+    targets = [
+        {"name": "coding/T2/fix-edge-case", "category": "coding", "score": 0.14},
+        {"name": "tool_use/T2/chain-tool-results", "category": "tool_use", "score": 0.4},
+    ]
+    history = [
+        {"accepted": False, "target": targets[1]["name"]},
+        {"accepted": False, "target": targets[0]["name"]},
+        {"accepted": False, "target": targets[0]["name"]},
+    ]
+
+    assert select_target({"next_targets": targets}, history) == targets[1]
+
+
+def test_target_memory_uses_the_merged_score_after_an_accepted_attempt():
+    stats = target_stats(
+        [
+            {
+                "accepted": True,
+                "target": "coding/T2/fix-edge-case",
+                "target_score_before": 0.2,
+                "target_score_after": 0.5,
+            }
+        ],
+        "coding/T2/fix-edge-case",
+    )
+
+    assert stats["last_target_score"] == 0.5
+
+
 def test_target_prefers_an_exact_capability_task_over_a_whole_run_metric():
     targets = [
         {"name": "efficiency/no-timeouts", "category": "efficiency", "score": 0.0},
@@ -388,6 +453,114 @@ def test_staged_prompts_inline_and_label_the_temporary_fixture():
         assert "not repository files" in prompt
         assert "must never be created under `morph/`" in prompt
     assert "CAUSE:" in implementation
+
+
+def test_staged_prompts_receive_target_specific_experience_memory():
+    target = {
+        "name": "coding/T2/fix-edge-case",
+        "category": "coding",
+        "score": 0.14,
+    }
+    history = [
+        {
+            "accepted": False,
+            "target": target["name"],
+            "score_before": 60.0,
+            "score_after": 60.0,
+            "rejection_reason": "target did not improve",
+            "diagnosis": "CAUSE:\nweak edit anchors\nCHANGE:\nchange edit_file guidance",
+            "files_changed": ["morph/agent.py"],
+        }
+    ]
+
+    diagnosis = build_diagnosis_prompt(target, history)
+    implementation = build_implementation_prompt(
+        target, "CAUSE:\nnew plan", history=history
+    )
+    for prompt in (diagnosis, implementation):
+        assert "Experience memory" in prompt
+        assert "change edit_file guidance" in prompt
+        assert "retry only if" in prompt
+
+
+def test_experience_memory_preserves_evidence_and_lessons():
+    entry = enrich_entry(
+        {
+            "ts": 1,
+            "iteration": 2,
+            "base_commit": "abc",
+            "accepted": False,
+            "target": "coding/T2/fix-edge-case",
+            "score_before": 60.0,
+            "score_after": 60.0,
+            "diagnosis": (
+                "CAUSE:\nThe edit anchor was guessed.\nFILES:\nmorph/agent.py\n"
+                "CHANGE:\nRequire a read before edit.\nTEST:\npytest"
+            ),
+            "rejection_reason": "the agent made no changes",
+            "tool_failures": ["edit_file: old_string not found in morph/agent.py"],
+            "files_changed": [],
+        }
+    )
+    memory = entry["experience"]
+
+    assert memory["hypothesis"] == "The edit anchor was guessed."
+    assert memory["approach"] == "Require a read before edit."
+    assert memory["failure_kind"] == "edit_context_mismatch"
+    assert "reading the exact real file" in memory["retry_condition"]
+
+
+def test_historical_fixture_copy_is_invalidated_not_learned_as_success():
+    entry = enrich_entry(
+        {
+            "ts": 1,
+            "iteration": 1,
+            "base_commit": "abc",
+            "accepted": True,
+            "target": "efficiency/no-timeouts",
+            "files_changed": ["morph/calc.py"],
+            "score_before": 60.0,
+            "score_after": 61.0,
+            "summary": "Created calc.py.",
+        }
+    )
+
+    assert entry["experience"]["outcome"] == "invalidated"
+    assert entry["experience"]["failure_kind"] == "invalidated_false_positive"
+    rendered = render_experience_memory([entry], "efficiency/no-timeouts")
+    assert "No verified successful approach" in rendered
+    assert "copied a temporary benchmark fixture" in rendered
+
+
+def test_identical_rejected_change_requires_new_benchmark_evidence():
+    history = [
+        {
+            "ts": 1,
+            "iteration": 1,
+            "base_commit": "abc",
+            "accepted": False,
+            "target": "coding/T2/fix-edge-case",
+            "score_before": 60.0,
+            "score_after": 60.0,
+            "target_score_before": 0.2,
+            "change_fingerprint": "same-final-state",
+            "rejection_reason": "target did not improve",
+        }
+    ]
+
+    duplicate = repeated_rejected_change(
+        history,
+        target="coding/T2/fix-edge-case",
+        change_fingerprint="same-final-state",
+        current_metric=0.2,
+    )
+    assert duplicate is not None
+    assert repeated_rejected_change(
+        history,
+        target="coding/T2/fix-edge-case",
+        change_fingerprint="same-final-state",
+        current_metric=0.4,
+    ) is None
 
 
 def test_new_morph_file_named_after_a_fixture_is_rejected(tmp_path: Path):

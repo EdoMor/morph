@@ -34,6 +34,19 @@ from morph.trace import EventLog, ProgressFile, TraceRenderer
 
 from .guard import violations
 from .memory import repeated_rejected_change
+from .proposals import (
+    PROPOSAL_SYSTEM_PROMPT,
+    PatchProposal,
+    ProposalReview,
+    apply_proposal,
+    build_proposal_prompt,
+    build_source_context,
+    load_strategy_cards,
+    make_proposal_registry,
+    parse_patch_proposal,
+    review_proposal,
+    select_strategy_cards,
+)
 from .prompts import (
     DIAGNOSIS_SYSTEM_PROMPT,
     SYSTEM_PROMPT,
@@ -55,6 +68,10 @@ AGENT_MAX_STEPS = 60
 AGENT_TIMEOUT = 3600.0
 DIAGNOSIS_MAX_STEPS = 12
 DIAGNOSIS_TIMEOUT = 1200.0
+PROPOSAL_CANDIDATES = 3
+PROPOSAL_MAX_STEPS = 4
+PROPOSAL_TIMEOUT = 600.0
+STRUCTURED_PROVIDERS = {"gemma", "google", "ollama"}
 MIN_TARGET_GAIN = 0.02
 
 
@@ -93,6 +110,9 @@ class Iteration:
     target_score_before: float | None = None
     target_score_after: float | None = None
     tool_failures: list[str] = field(default_factory=list)
+    strategy_id: str = ""
+    proposal: dict[str, Any] | None = None
+    proposal_attempts: list[dict[str, Any]] = field(default_factory=list)
     change_fingerprint: str = ""
     measurement_after: dict[str, Any] | None = field(default=None, repr=False)
 
@@ -118,6 +138,9 @@ class Iteration:
             "target_score_before": self.target_score_before,
             "target_score_after": self.target_score_after,
             "tool_failures": self.tool_failures,
+            "strategy_id": self.strategy_id,
+            "proposal": self.proposal,
+            "proposal_attempts": self.proposal_attempts,
             "change_fingerprint": self.change_fingerprint,
         }
 
@@ -370,6 +393,167 @@ def _fixture_leaks(
     return leaks
 
 
+async def _structured_patch_stage(
+    *,
+    worktree: Path,
+    config: Config,
+    target: dict[str, Any] | None,
+    diagnosis: str,
+    history: list[dict[str, Any]],
+    focus: str | None,
+    tracer: TraceRenderer,
+    progress: ProgressFile,
+) -> tuple[
+    PatchProposal | None,
+    list[dict[str, Any]],
+    int,
+    list[str],
+]:
+    """Generate, filter, and deterministically apply one constrained patch.
+
+    Each proposal gets a clean Morph Agent context, one typed action, exact
+    source excerpts, and a different strategy prior. The proposer never gets a
+    write tool. Applying the highest-ranked valid replacement is controller
+    code, so Gemma only has to solve the part it is good at: choosing a small
+    causal source transformation.
+    """
+    cards = select_strategy_cards(
+        history,
+        target,
+        limit=PROPOSAL_CANDIDATES,
+        cards=load_strategy_cards(),
+    )
+    source = build_source_context(worktree, diagnosis, target)
+    strategy_ids = {str(card.get("id") or "") for card in cards}
+    reviews: list[ProposalReview] = []
+    total_steps = 0
+    failures: list[str] = []
+    temperatures = (0.0, max(config.temperature, 0.2), max(config.temperature, 0.5))
+
+    if len(cards) < PROPOSAL_CANDIDATES:
+        return (
+            None,
+            [
+                {
+                    "candidate": 0,
+                    "valid": False,
+                    "score": 0.0,
+                    "errors": [
+                        f"strategy library supplied {len(cards)} cards; "
+                        f"{PROPOSAL_CANDIDATES} required"
+                    ],
+                    "proposal": None,
+                }
+            ],
+            0,
+            ["proposal gate: insufficient curated strategy cards"],
+        )
+    if not source.paths:
+        return (
+            None,
+            [
+                {
+                    "candidate": 0,
+                    "valid": False,
+                    "score": 0.0,
+                    "errors": ["no editable Morph source could be resolved"],
+                    "proposal": None,
+                }
+            ],
+            0,
+            ["proposal gate: no editable Morph source could be resolved"],
+        )
+
+    for candidate, card in enumerate(cards, start=1):
+        assigned_strategy = str(card["id"])
+        tracer.header(
+            f"proposal {candidate}/{PROPOSAL_CANDIDATES} — {assigned_strategy}"
+        )
+        progress.update(
+            phase="proposing",
+            activity=(
+                f"Gemma proposal {candidate}/{PROPOSAL_CANDIDATES}: "
+                f"{assigned_strategy}"
+            ),
+        )
+        captured: list[PatchProposal] = []
+        proposal_agent = Agent(
+            config=_agent_config(worktree, config),
+            provider=get_provider(
+                config.provider,
+                model=config.model,
+                base_url=config.base_url,
+                temperature=temperatures[candidate - 1],
+            ),
+            tools=make_proposal_registry(captured),
+            system_prompt=PROPOSAL_SYSTEM_PROMPT,
+        )
+        try:
+            result = await _run_traced(
+                proposal_agent,
+                build_proposal_prompt(
+                    target,
+                    diagnosis,
+                    history,
+                    cards,
+                    source,
+                    assigned_strategy=assigned_strategy,
+                    candidate=candidate,
+                    focus=focus,
+                ),
+                PROPOSAL_MAX_STEPS,
+                tracer,
+                progress,
+                PROPOSAL_TIMEOUT,
+            )
+        finally:
+            await proposal_agent.close()
+
+        total_steps += result.steps
+        proposal = captured[-1] if captured else parse_patch_proposal(result.text or "")
+        review = review_proposal(
+            worktree,
+            proposal,
+            allowed_paths=source.paths,
+            strategy_ids=strategy_ids,
+            target=target,
+            candidate=candidate,
+            assigned_strategy=assigned_strategy,
+        )
+        if len(captured) > 1:
+            review.errors.append(
+                f"submitted {len(captured)} proposals; exactly one is allowed"
+            )
+            review.valid = False
+            review.score = 0.0
+        if result.error:
+            review.errors.append(f"proposal agent failed: {result.error}")
+            review.valid = False
+            review.score = 0.0
+        for call in result.tool_calls:
+            if not call.get("ok"):
+                review.errors.append(
+                    f"{call.get('tool', '?')}: "
+                    f"{str(call.get('content') or '')[:300]}"
+                )
+                review.valid = False
+                review.score = 0.0
+        reviews.append(review)
+        if review.errors:
+            failures.append(
+                f"proposal {candidate}: " + "; ".join(review.errors[:3])
+            )
+
+    valid = [review for review in reviews if review.valid and review.proposal]
+    records = [review.record() for review in reviews]
+    if not valid:
+        return None, records, total_steps, failures[:8]
+
+    chosen = max(valid, key=lambda review: (review.score, -review.candidate))
+    apply_proposal(worktree, chosen.proposal)
+    return chosen.proposal, records, total_steps, failures[:8]
+
+
 # ---------------------------------------------------------------------------
 
 
@@ -466,56 +650,95 @@ async def run_iteration(
             diagnosis = (diagnosis_result.text or "").strip()
             iteration.diagnosis = diagnosis[:3000]
 
-        prompt = build_implementation_prompt(
-            target, diagnosis, history=history, focus=focus
-        )
         tracer.header(f"implementation — {iteration.target or 'fallback'}")
         progress.update(phase="editing", activity="implementing the diagnosis")
 
-        # Morph improves Morph: the editing agent is this project's own agent
-        # (R-702), in the isolated candidate worktree.
-        agent = Agent(
-            config=agent_config,
-            provider=get_provider(
-                config.provider,
-                model=config.model,
-                base_url=config.base_url,
-                temperature=config.temperature,
-            ),
-            tools=_restricted_tools(
-                agent_config,
-                {
-                    "read_file",
-                    "write_file",
-                    "edit_file",
-                    "list_dir",
-                    "glob",
-                    "grep",
-                    "shell",
-                },
-            ),
-            system_prompt=SYSTEM_PROMPT,
-            require_edit=True,
-        )
-        try:
-            result = await _run_traced(
-                agent, prompt, AGENT_MAX_STEPS, tracer, progress, AGENT_TIMEOUT
+        if config.provider in STRUCTURED_PROVIDERS:
+            # Gemma's real failure mode is not a shortage of prose reasoning;
+            # it is carrying a long emulated tool protocol through to an exact
+            # edit. Keep Morph's own Agent (R-702), but reduce mutation to three
+            # clean-context, typed proposals and deterministic application.
+            proposal, attempts, steps, failures = await _structured_patch_stage(
+                worktree=worktree,
+                config=config,
+                target=target,
+                diagnosis=diagnosis,
+                history=history,
+                focus=focus,
+                tracer=tracer,
+                progress=progress,
             )
-        finally:
-            await agent.close()
+            iteration.proposal_attempts = attempts
+            iteration.agent_steps = steps
+            iteration.tool_failures = failures
+            if proposal is None:
+                evidence = "; ".join(
+                    error
+                    for attempt in attempts
+                    for error in attempt.get("errors", [])[:1]
+                )
+                iteration.rejection_reason = (
+                    f"meta-planning gate rejected all {PROPOSAL_CANDIDATES} "
+                    f"proposals"
+                    + (f": {evidence[:900]}" if evidence else "")
+                )
+                iteration.score_after = iteration.score_before
+                return iteration
+            iteration.strategy_id = proposal.strategy_id
+            iteration.proposal = proposal.public_record()
+            iteration.summary = (
+                f"Structured patch via {proposal.strategy_id}: "
+                f"{proposal.hypothesis}. Expected: {proposal.expected_effect}"
+            )[:2000]
+        else:
+            # Echo remains the deterministic conformance harness. Third-party
+            # providers retain the general tool loop until they opt into the
+            # constrained proposal protocol with provider-specific tests.
+            prompt = build_implementation_prompt(
+                target, diagnosis, history=history, focus=focus
+            )
+            agent = Agent(
+                config=agent_config,
+                provider=get_provider(
+                    config.provider,
+                    model=config.model,
+                    base_url=config.base_url,
+                    temperature=config.temperature,
+                ),
+                tools=_restricted_tools(
+                    agent_config,
+                    {
+                        "read_file",
+                        "write_file",
+                        "edit_file",
+                        "list_dir",
+                        "glob",
+                        "grep",
+                        "shell",
+                    },
+                ),
+                system_prompt=SYSTEM_PROMPT,
+                require_edit=True,
+            )
+            try:
+                result = await _run_traced(
+                    agent, prompt, AGENT_MAX_STEPS, tracer, progress, AGENT_TIMEOUT
+                )
+            finally:
+                await agent.close()
 
-        iteration.summary = (result.text or "").strip()[:2000]
-        iteration.agent_steps = result.steps
-        iteration.tool_failures = [
-            f"{call.get('tool', '?')}: {str(call.get('content') or '')[:400]}"
-            for call in result.tool_calls
-            if not call.get("ok")
-        ][:8]
+            iteration.summary = (result.text or "").strip()[:2000]
+            iteration.agent_steps = result.steps
+            iteration.tool_failures = [
+                f"{call.get('tool', '?')}: {str(call.get('content') or '')[:400]}"
+                for call in result.tool_calls
+                if not call.get("ok")
+            ][:8]
 
-        if result.error:
-            iteration.rejection_reason = f"agent failed: {result.error}"
-            iteration.score_after = iteration.score_before
-            return iteration
+            if result.error:
+                iteration.rejection_reason = f"agent failed: {result.error}"
+                iteration.score_after = iteration.score_before
+                return iteration
 
         iteration.files_changed = [
             name

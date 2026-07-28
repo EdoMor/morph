@@ -872,6 +872,40 @@ def test_R_705_history_is_recorded_and_fed_back(tmp_path):
     assert "retry only if" in prompt
 
 
+def test_R_722_gemma_mutation_is_generated_filtered_then_applied(repo_root):
+    """R-722: one narrow model action; independent code owns every hard gate."""
+    from selfimprove.guard import PROTECTED
+    from selfimprove.loop import (
+        PROPOSAL_CANDIDATES,
+        STRUCTURED_PROVIDERS,
+        _structured_patch_stage,
+    )
+    from selfimprove.proposals import (
+        PROPOSAL_SYSTEM_PROMPT,
+        load_strategy_cards,
+        make_proposal_registry,
+        review_proposal,
+    )
+
+    assert PROPOSAL_CANDIDATES >= 3
+    assert {"gemma", "ollama"} <= STRUCTURED_PROVIDERS
+    assert callable(_structured_patch_stage)
+    assert make_proposal_registry([]).names() == ["propose_patch"]
+    assert "do not edit files" in PROPOSAL_SYSTEM_PROMPT.lower()
+
+    cards = load_strategy_cards()
+    assert len(cards) >= PROPOSAL_CANDIDATES
+    assert all(card["sources"] for card in cards)
+    assert all(
+        source.get("url", "").startswith("https://")
+        for card in cards
+        for source in card["sources"]
+    )
+    assert callable(review_proposal)
+    assert "selfimprove/proposals.py" in PROTECTED
+    assert "selfimprove/strategies.json" in PROTECTED
+
+
 def test_R_706_loop_runs_unattended_in_ci(repo_root):
     """R-706: a scheduled GitHub workflow and a Codespaces devcontainer exist."""
     workflow = repo_root / ".github" / "workflows" / "self-improve.yml"
@@ -1075,6 +1109,8 @@ def test_R_707_goalposts_are_protected(repo_root):
         "bench/scorecard.py",
         "bench/runner.py",
         "bench/tasks",
+        "selfimprove/proposals.py",
+        "selfimprove/strategies.json",
     ):
         assert required in PROTECTED
 

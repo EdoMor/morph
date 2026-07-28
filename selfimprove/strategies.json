@@ -1,0 +1,131 @@
+[
+  {
+    "id": "exact-anchor-editing",
+    "title": "Exact-anchor deterministic editing",
+    "failure_kinds": [
+      "edit_context_mismatch",
+      "no_change",
+      "proposal_invalid"
+    ],
+    "mechanism": "Make the model quote one exact, unique source span and propose its replacement. Let deterministic code validate and apply the replacement instead of asking the model to operate a general editing tool.",
+    "experiment": "Measure proposal parse rate, unique-anchor rate, and successful file-change rate before spending a benchmark call.",
+    "risks": "A narrow source excerpt can hide necessary context, so reject rather than guess when the anchor is absent or ambiguous.",
+    "sources": [
+      {
+        "name": "Darwin Godel Machine",
+        "url": "https://arxiv.org/abs/2505.22954",
+        "license": "paper; implementation Apache-2.0",
+        "lesson": "Discovered more granular file viewing and precise string-replacement editing."
+      },
+      {
+        "name": "Claude Code hooks",
+        "url": "https://code.claude.com/docs/en/hooks-guide",
+        "license": "documentation",
+        "lesson": "Put deterministic enforcement in lifecycle code rather than relying on model compliance."
+      }
+    ]
+  },
+  {
+    "id": "trace-first-root-cause",
+    "title": "Trace-first root-cause analysis",
+    "failure_kinds": [
+      "no_change",
+      "target_no_gain",
+      "other_rejection"
+    ],
+    "mechanism": "Compare the failing trace with the task rubric and real implementation, identify the first divergence, and change the general mechanism responsible for that divergence.",
+    "experiment": "Require the hypothesis to name one observed failure, one real source location, and one predicted behavior change.",
+    "risks": "Benchmark fixtures are evidence only; copying their functions into Morph is a false improvement.",
+    "sources": [
+      {
+        "name": "SICA Archive Explorer",
+        "url": "https://github.com/MaximeRobeyns/self_improving_coding_agent/blob/master/base_agent/src/agents/implementations/archive_explorer.py",
+        "license": "MIT",
+        "lesson": "Compare iterations, best and worst problems, change logs, and detailed traces before choosing a modification."
+      }
+    ]
+  },
+  {
+    "id": "generate-filter-verify",
+    "title": "Generate, filter, then verify",
+    "failure_kinds": [
+      "no_change",
+      "target_no_gain",
+      "regression",
+      "local_gain_global_regression",
+      "proposal_invalid"
+    ],
+    "mechanism": "Generate several small competing patches from clean contexts, reject structurally invalid proposals, and evaluate only the strongest surviving candidate.",
+    "experiment": "Generate three candidates assigned different strategy priors; compare their static validity before selecting one for target preflight.",
+    "risks": "Candidate count must stay small because local Gemma inference and benchmark calls are expensive.",
+    "sources": [
+      {
+        "name": "Claude Code dynamic workflows",
+        "url": "https://claude.com/blog/a-harness-for-every-task-dynamic-workflows-in-claude-code",
+        "license": "documentation",
+        "lesson": "Generate-and-filter, tournaments, and adversarial verification reduce self-preferential single-context failures."
+      },
+      {
+        "name": "Darwin Godel Machine",
+        "url": "https://arxiv.org/abs/2505.22954",
+        "license": "paper; implementation Apache-2.0",
+        "lesson": "Multiple attempts followed by model-based selection emerged as a useful workflow improvement."
+      }
+    ]
+  },
+  {
+    "id": "bounded-context-management",
+    "title": "Bounded relevant source context",
+    "failure_kinds": [
+      "edit_context_mismatch",
+      "timeout",
+      "agent_failure",
+      "diagnosis_failure"
+    ],
+    "mechanism": "Extract a small set of real source windows around symbols named in the diagnosis. Keep task evidence, history, planning, and implementation in separate bounded contexts.",
+    "experiment": "Track source-context size and whether the selected anchor was present verbatim in the supplied excerpt.",
+    "risks": "Over-aggressive truncation can remove cross-module constraints; include several relevant files but cap the total.",
+    "sources": [
+      {
+        "name": "Darwin Godel Machine",
+        "url": "https://arxiv.org/abs/2505.22954",
+        "license": "paper; implementation Apache-2.0",
+        "lesson": "Long-context management was one of the automatically discovered improvements."
+      },
+      {
+        "name": "Claude Code subagents",
+        "url": "https://code.claude.com/docs/en/sub-agents",
+        "license": "documentation",
+        "lesson": "Specialized isolated contexts prevent side-task material from flooding the implementation context."
+      }
+    ]
+  },
+  {
+    "id": "independent-verification",
+    "title": "Independent mechanical verification",
+    "failure_kinds": [
+      "conformance_failure",
+      "regression",
+      "local_gain_global_regression",
+      "protected_goalpost",
+      "fixture_copy"
+    ],
+    "mechanism": "Keep validation independent of the proposing model: enforce path policy, syntax, protected files, fixture boundaries, exact-target gain, conformance, and global non-regression in code.",
+    "experiment": "Record the first deterministic gate that rejects each candidate and feed that evidence back as experience.",
+    "risks": "Visible evaluation can be overfit, so retain protected and eventually held-out checks.",
+    "sources": [
+      {
+        "name": "Claude Code dynamic workflows",
+        "url": "https://claude.com/blog/a-harness-for-every-task-dynamic-workflows-in-claude-code",
+        "license": "documentation",
+        "lesson": "Use adversarial verification and quarantine agents that consume untrusted public content from high-privilege actors."
+      },
+      {
+        "name": "Huxley-Godel Machine",
+        "url": "https://arxiv.org/abs/2510.21614",
+        "license": "paper",
+        "lesson": "Decouple candidate expansion from evaluation and stop spending evaluations on unpromising agents."
+      }
+    ]
+  }
+]

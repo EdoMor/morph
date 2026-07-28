@@ -78,6 +78,8 @@ def _failure_kind(
         return "edit_context_mismatch"
     if "copied synthetic benchmark fixture" in reason:
         return "fixture_copy"
+    if "meta-planning gate rejected" in reason:
+        return "proposal_invalid"
     if "made no changes" in reason:
         return "no_change"
     if "target did not improve" in reason:
@@ -120,6 +122,12 @@ LESSONS: dict[str, tuple[str, str]] = {
     "no_change": (
         "Reasoning ended without a repository change, so there was nothing to evaluate.",
         "Retry only with a concrete existing file, a specific mechanism, and an executable edit.",
+    ),
+    "proposal_invalid": (
+        "The model's proposed mutation was not structurally executable, so it was "
+        "rejected before consuming a benchmark run.",
+        "Retry only with different source evidence or strategy, and satisfy the "
+        "recorded path, anchor, fixture, size, and syntax gate.",
     ),
     "target_no_gain": (
         "The code changed but the exact target did not improve.",
@@ -167,8 +175,15 @@ LESSONS: dict[str, tuple[str, str]] = {
 def experience_from_entry(entry: dict[str, Any]) -> dict[str, Any]:
     """Derive a compact, deterministic experience record from one history row."""
     diagnosis = str(entry.get("diagnosis") or "")
-    hypothesis = _diagnosis_section(diagnosis, "CAUSE")
+    proposal = entry.get("proposal") if isinstance(entry.get("proposal"), dict) else {}
+    hypothesis = _compact(proposal.get("hypothesis")) or _diagnosis_section(
+        diagnosis, "CAUSE"
+    )
     planned_change = _diagnosis_section(diagnosis, "CHANGE")
+    if proposal:
+        planned_change = _compact(
+            f"{proposal.get('path')}: {proposal.get('expected_effect')}"
+        )
     summary = _compact(entry.get("summary"), 700)
     if planned_change.lower() in {"none", "no change", "no code change is warranted"}:
         planned_change = ""
@@ -206,8 +221,21 @@ def experience_from_entry(entry: dict[str, Any]) -> dict[str, Any]:
     evidence.extend(
         _compact(item, 360) for item in (entry.get("tool_failures") or [])[:3]
     )
+    for attempt in (entry.get("proposal_attempts") or [])[:3]:
+        if not isinstance(attempt, dict) or attempt.get("valid"):
+            continue
+        errors = attempt.get("errors") or []
+        if errors:
+            evidence.append(
+                _compact(
+                    f"proposal {attempt.get('candidate', '?')}: {errors[0]}",
+                    360,
+                )
+            )
 
     files = sorted(str(path) for path in entry.get("files_changed") or [])
+    if not files and proposal.get("path"):
+        files = [str(proposal["path"])]
     fingerprint_material = {
         "target": str(entry.get("target") or ""),
         "files": files,

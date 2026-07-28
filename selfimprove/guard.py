@@ -24,6 +24,8 @@ PROTECTED: tuple[str, ...] = (
     "selfimprove/guard.py",
     "selfimprove/loop.py",
     "selfimprove/memory.py",
+    "selfimprove/proposals.py",
+    "selfimprove/strategies.json",
     "selfimprove/history.jsonl",
     ".github/workflows/self-improve.yml",
 )

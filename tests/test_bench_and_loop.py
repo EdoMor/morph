@@ -29,6 +29,17 @@ from selfimprove.prompts import (
     load_history,
     select_target,
 )
+from selfimprove.proposals import (
+    PatchProposal,
+    apply_proposal,
+    build_proposal_prompt,
+    build_source_context,
+    load_strategy_cards,
+    make_proposal_registry,
+    parse_patch_proposal,
+    review_proposal,
+    select_strategy_cards,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -225,6 +236,8 @@ def test_feedback_when_everything_passes_asks_for_harder_tasks():
         "selfimprove/loop.py",
         "selfimprove/guard.py",
         "selfimprove/memory.py",
+        "selfimprove/proposals.py",
+        "selfimprove/strategies.json",
         "selfimprove/history.jsonl",
         ".github/workflows/self-improve.yml",
     ],
@@ -508,6 +521,280 @@ def test_experience_memory_preserves_evidence_and_lessons():
     assert memory["approach"] == "Require a read before edit."
     assert memory["failure_kind"] == "edit_context_mismatch"
     assert "reading the exact real file" in memory["retry_condition"]
+
+
+def test_strategy_retrieval_uses_all_target_failures_and_keeps_provenance():
+    target = "coding/T2/fix-edge-case"
+    history = [
+        {
+            "target": target,
+            "accepted": False,
+            "rejection_reason": "the agent made no changes",
+            "tool_failures": ["edit_file: old_string not found in morph/agent.py"],
+        },
+        {
+            "target": "tool_use/T1/other",
+            "accepted": False,
+            "rejection_reason": "score regressed",
+        },
+    ]
+
+    selected = select_strategy_cards(history, target)
+
+    assert len(selected) == 3
+    assert selected[0]["id"] == "exact-anchor-editing"
+    assert selected[0]["sources"][0]["url"].startswith("https://")
+    assert any(card["id"] == "bounded-context-management" for card in selected)
+
+
+def test_proposal_prompt_contains_exact_bounded_source_and_one_action(tmp_path: Path):
+    (tmp_path / "morph").mkdir()
+    source_text = "class Agent:\n    def answer(self):\n        return 'old'\n"
+    (tmp_path / "morph" / "agent.py").write_text(source_text, "utf-8")
+    target = {
+        "name": "coding/T1/read-and-report",
+        "category": "coding",
+        "score": 0.2,
+    }
+    source = build_source_context(
+        tmp_path,
+        "CAUSE:\nAgent.answer returns too early.\nFILES:\nmorph/agent.py",
+        target,
+    )
+    cards = load_strategy_cards()[:3]
+    prompt = build_proposal_prompt(
+        target,
+        "CAUSE:\nAgent.answer returns too early.",
+        [],
+        cards,
+        source,
+        assigned_strategy=cards[0]["id"],
+        candidate=1,
+    )
+
+    assert source.paths == ("morph/agent.py",)
+    assert source_text.rstrip() in prompt
+    assert "Line-number labels are deliberately absent" in prompt
+    assert "Call `propose_patch` exactly once" in prompt
+    assert len(prompt) < 30_000
+
+
+def test_proposal_registry_captures_one_typed_proposal():
+    captured = []
+    registry = make_proposal_registry(captured)
+    arguments = {
+        "hypothesis": "A null guard prevents a fabricated answer.",
+        "strategy_id": "exact-anchor-editing",
+        "path": "morph/agent.py",
+        "old_string": "return value",
+        "new_string": "return value or ''",
+        "expected_effect": "The agent reports missing values honestly.",
+        "test": "pytest tests/test_agent.py -q",
+    }
+
+    result = asyncio.run(registry.call("propose_patch", arguments))
+
+    assert registry.names() == ["propose_patch"]
+    assert result.ok
+    assert captured == [PatchProposal.from_mapping(arguments)]
+
+
+def test_plain_json_proposal_is_salvaged():
+    proposal = parse_patch_proposal(
+        'Result:\n{"hypothesis":"h","strategy_id":"s","path":"morph/agent.py",'
+        '"old_string":"x = 1","new_string":"x = 2","expected_effect":"e",'
+        '"test":"pytest"}'
+    )
+
+    assert proposal is not None
+    assert proposal.path == "morph/agent.py"
+    assert proposal.new_string == "x = 2"
+
+
+def test_meta_planning_gate_applies_one_valid_exact_replacement(tmp_path: Path):
+    (tmp_path / "morph").mkdir()
+    path = tmp_path / "morph" / "agent.py"
+    path.write_text("def answer(value):\n    return value\n", "utf-8")
+    proposal = PatchProposal(
+        hypothesis="None should be handled before returning a value.",
+        strategy_id="exact-anchor-editing",
+        path="morph/agent.py",
+        old_string="def answer(value):\n    return value",
+        new_string=(
+            "def answer(value):\n"
+            "    if value is None:\n"
+            "        return ''\n"
+            "    return value"
+        ),
+        expected_effect="Missing values no longer leak into the final answer.",
+        test="pytest tests/test_agent.py -q",
+    )
+    review = review_proposal(
+        tmp_path,
+        proposal,
+        allowed_paths=("morph/agent.py",),
+        strategy_ids={"exact-anchor-editing"},
+        target={"name": "coding/T1/read-and-report"},
+        candidate=1,
+        assigned_strategy="exact-anchor-editing",
+    )
+
+    assert review.valid
+    assert review.score > 100
+    apply_proposal(tmp_path, proposal)
+    assert "if value is None" in path.read_text("utf-8")
+
+
+def test_structured_stage_generates_three_candidates_and_applies_best(
+    monkeypatch,
+    tmp_path: Path,
+):
+    import io
+
+    import selfimprove.loop as loop_module
+    from morph.config import Config
+    from morph.llm.echo import EchoProvider
+    from morph.trace import ProgressFile, TraceRenderer
+
+    (tmp_path / "morph").mkdir()
+    path = tmp_path / "morph" / "agent.py"
+    old = "def answer(value):\n    return value"
+    path.write_text(old + "\n", "utf-8")
+    strategy_ids = [card["id"] for card in load_strategy_cards()[:3]]
+    providers = []
+    for index, strategy_id in enumerate(strategy_ids, start=1):
+        proposal = {
+            "hypothesis": ("evidence " * index).strip(),
+            "strategy_id": strategy_id,
+            "path": "morph/agent.py",
+            "old_string": old,
+            "new_string": old + f"\n# candidate {index}",
+            "expected_effect": f"candidate {index} is independently executable",
+            "test": "pytest tests/test_agent.py -q",
+        }
+        providers.append(
+            EchoProvider(
+                script=[
+                    EchoProvider.call("propose_patch", **proposal),
+                    EchoProvider.text_response("Proposal captured."),
+                ]
+            )
+        )
+    monkeypatch.setattr(
+        loop_module,
+        "get_provider",
+        lambda *args, **kwargs: providers.pop(0),
+    )
+
+    chosen, attempts, steps, failures = asyncio.run(
+        loop_module._structured_patch_stage(
+            worktree=tmp_path,
+            config=Config(workspace=tmp_path, provider="ollama"),
+            target={
+                "name": "coding/T1/read-and-report",
+                "category": "coding",
+                "score": 0.2,
+            },
+            diagnosis="CAUSE:\nThe answer path needs one explicit invariant.",
+            history=[],
+            focus=None,
+            tracer=TraceRenderer(stream=io.StringIO()),
+            progress=ProgressFile(tmp_path / "progress.json"),
+        )
+    )
+
+    assert chosen is not None
+    assert len(attempts) == 3
+    assert all(attempt["valid"] for attempt in attempts)
+    assert steps == 6
+    assert failures == []
+    assert "# candidate 3" in path.read_text("utf-8")
+
+
+@pytest.mark.parametrize(
+    ("proposal", "error"),
+    [
+        (
+            PatchProposal(
+                "h",
+                "exact-anchor-editing",
+                "morph/agent.py",
+                "invented source",
+                "replacement",
+                "e",
+                "pytest",
+            ),
+            "old_string occurs 0 times",
+        ),
+        (
+            PatchProposal(
+                "h",
+                "exact-anchor-editing",
+                "selfimprove/loop.py",
+                "x",
+                "y",
+                "e",
+                "pytest",
+            ),
+            "was not supplied as editable source",
+        ),
+        (
+            PatchProposal(
+                "h",
+                "exact-anchor-editing",
+                "morph/agent.py",
+                "return value",
+                "def average(values):\n    return 0.0",
+                "e",
+                "pytest",
+            ),
+            "benchmark fixture symbol",
+        ),
+    ],
+)
+def test_meta_planning_gate_rejects_guesses_goalposts_and_fixture_copies(
+    tmp_path: Path,
+    proposal: PatchProposal,
+    error: str,
+):
+    (tmp_path / "morph").mkdir()
+    (tmp_path / "morph" / "agent.py").write_text(
+        "def answer(value):\n    return value\n",
+        "utf-8",
+    )
+    review = review_proposal(
+        tmp_path,
+        proposal,
+        allowed_paths=("morph/agent.py",),
+        strategy_ids={"exact-anchor-editing"},
+        target={"name": "coding/T2/fix-edge-case"},
+    )
+
+    assert not review.valid
+    assert any(error in message for message in review.errors)
+
+
+def test_invalid_proposal_is_saved_as_specific_experience():
+    entry = enrich_entry(
+        {
+            "target": "coding/T1/read-and-report",
+            "accepted": False,
+            "rejection_reason": (
+                "meta-planning gate rejected all 3 proposals: "
+                "old_string occurs 0 times"
+            ),
+            "proposal_attempts": [
+                {
+                    "candidate": 1,
+                    "valid": False,
+                    "errors": ["old_string occurs 0 times"],
+                }
+            ],
+        }
+    )
+
+    assert entry["experience"]["failure_kind"] == "proposal_invalid"
+    assert "proposal 1" in " ".join(entry["experience"]["evidence"])
 
 
 def test_historical_fixture_copy_is_invalidated_not_learned_as_success():

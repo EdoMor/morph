@@ -248,6 +248,19 @@ user controls — including a phone.
   The trace file is bounded, so a long run cannot grow into a download the page
   chokes on, and the page distinguishes a live run from a finished one by
   whether the heartbeat is still moving.
+- **R-722** — Gemma's mutation step is **generate → filter → apply**, not an
+  unrestricted editing conversation. At least three candidates run in fresh
+  Morph Agent contexts with different retrieved strategy priors, bounded exact
+  excerpts from real editable source, and one typed `propose_patch` action.
+  Each proposal states a causal hypothesis and one exact string replacement.
+
+  Deterministic controller code, not the proposing model, validates that the
+  path was supplied and is editable, the old source anchor is present exactly
+  once, the change is small, the benchmark fixture is not being copied, and
+  the resulting Python parses. It applies only the best valid proposal; if none
+  pass, the iteration stops before benchmarking and records every rejection as
+  experience. The strategy library carries source URLs and distilled lessons;
+  raw web content never enters the privileged patch context.
 - **R-717** — Progress is **public and legible without reading the repository**.
   A GitHub Pages dashboard shows the current score, its category and difficulty
   breakdown, the score over time, the available releases, and **every attempt —

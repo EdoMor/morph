@@ -82,22 +82,30 @@ python -m selfimprove.loop --dry-run        # measure without merging
 
 Each iteration:
 
-1. **Measures** the current code → composite score + failure digest.
-2. **Builds a prompt** from the requirements, the failures, and every previous
-   attempt with its outcome — so the model stops re-trying dead ends.
-3. **Runs Morph's own agent** with Gemma, in a fresh `git worktree`, with real
-   file and shell tools.
-4. **Re-measures**, then **accepts or reverts**:
+1. **Measures the current version in a fresh Python process** → composite score
+   + failure archive. Candidate imports therefore come from the candidate
+   worktree, never from a cached parent-process module.
+2. **Selects one exact capability task** and builds a compact dossier containing
+   its prompt, rubric, temporary fixtures, observed trace, and recent attempts.
+3. **Runs two fresh Gemma contexts** in a `git worktree`: a read-only diagnosis
+   stage, then a small-tool-surface implementation stage. This is the local
+   Gemma-sized version of an archive-explorer → software-engineer handoff.
+4. **Re-runs the exact target first.** No measured improvement means immediate
+   rejection; only a promising candidate pays for the full benchmark.
+5. **Runs the full benchmark once**, then **accepts or reverts**:
    - conformance suite red → rejected;
+   - the selected task did not improve → rejected;
    - score went down → rejected;
    - a protected file was touched → rejected outright;
+   - a synthetic fixture was copied into `morph/` → rejected outright;
    - otherwise → committed and fast-forwarded onto the working branch.
-5. **Cuts a version** — every accepted iteration bumps `morph.__version__`,
+6. **Cuts a version** — every accepted iteration bumps `morph.__version__`,
    writes a changelog entry, and becomes a `release: vX.Y.Z` commit. The next
    iteration therefore improves the version that was just released, not the one
    before it. The bump is made by the loop, not the model: a change under test
    has nothing to gain from choosing its own version number.
-6. **Appends** the outcome to `selfimprove/history.jsonl`.
+7. **Appends** the diagnosis, tool failures, target delta, full delta and verdict
+   to `selfimprove/history.jsonl`.
 
 Then, once per run: publish to `main`, tag each version, and **build an APK per
 version and attach it to a GitHub Release**.

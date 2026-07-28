@@ -15,7 +15,12 @@ import pytest
 
 from bench.scorecard import WEIGHTS, CheckResult, Scorecard, compare
 from selfimprove.guard import is_protected, violations
-from selfimprove.prompts import build_improvement_prompt, select_target
+from selfimprove.prompts import (
+    build_diagnosis_prompt,
+    build_implementation_prompt,
+    build_improvement_prompt,
+    select_target,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -145,6 +150,26 @@ def test_scorecard_round_trips_through_json(tmp_path: Path):
     assert json.dumps(data)  # serialisable end to end
 
 
+@pytest.mark.asyncio
+async def test_benchmark_can_recheck_one_exact_candidate_target(config):
+    from bench.runner import run_benchmark
+
+    label = "coding/T2/fix-edge-case"
+    card = await run_benchmark(
+        config,
+        skip_requirements=True,
+        task_labels={label},
+        trace=False,
+    )
+    capability = [
+        result
+        for result in card.results
+        if result.category in {"coding", "tool_use", "mcp", "skills"}
+    ]
+
+    assert [result.name for result in capability] == [label]
+
+
 def test_render_and_feedback_name_the_failures():
     card = Scorecard()
     card.add(
@@ -188,6 +213,7 @@ def test_feedback_when_everything_passes_asks_for_harder_tasks():
         "./REQUIREMENTS.md",
         "tests/test_requirements.py",
         "bench/scorecard.py",
+        "bench/runner.py",
         "selfimprove/loop.py",
         "selfimprove/guard.py",
         ".github/workflows/self-improve.yml",
@@ -202,7 +228,6 @@ def test_protected_paths_are_recognised(path: str):
     [
         "morph/agent.py",
         "tests/test_agent.py",
-        "bench/runner.py",
         "bench/tasks_notes.md",
         "REQUIREMENTS-notes.md",
         "webapp/app.js",
@@ -315,6 +340,15 @@ def test_target_rotates_away_from_a_recent_rejection():
     assert select_target({"next_targets": targets}, history) == targets[1]
 
 
+def test_target_prefers_an_exact_capability_task_over_a_whole_run_metric():
+    targets = [
+        {"name": "efficiency/no-timeouts", "category": "efficiency", "score": 0.0},
+        {"name": "coding/T2/fix-edge-case", "category": "coding", "score": 0.14},
+    ]
+
+    assert select_target({"gated": False, "next_targets": targets}, []) == targets[1]
+
+
 def test_prompt_gives_gemma_one_synthetic_target_and_a_first_action():
     target = {
         "name": "coding/T2/fix-edge-case",
@@ -333,6 +367,61 @@ def test_prompt_gives_gemma_one_synthetic_target_and_a_first_action():
     assert 'name="fix-edge-case"' in prompt
     assert "bench/tasks/coding.py" in prompt
     assert "evidence, not source code" in prompt
+
+
+def test_staged_prompts_inline_and_label_the_temporary_fixture():
+    target = {
+        "name": "coding/T2/fix-edge-case",
+        "category": "coding",
+        "score": 0.14,
+        "detail": "average([]) raised ZeroDivisionError",
+    }
+    diagnosis = build_diagnosis_prompt(target, [])
+    implementation = build_implementation_prompt(
+        target,
+        "CAUSE:\nediting errors\nFILES:\nmorph/tools/files.py\n"
+        "CHANGE:\nimprove feedback\nTEST:\npytest",
+    )
+
+    for prompt in (diagnosis, implementation):
+        assert "fixture `calc.py`" in prompt
+        assert "not repository files" in prompt
+        assert "must never be created under `morph/`" in prompt
+    assert "CAUSE:" in implementation
+
+
+def test_new_morph_file_named_after_a_fixture_is_rejected(tmp_path: Path):
+    from selfimprove.loop import _fixture_leaks
+
+    repo = tmp_path / "repo"
+    (repo / "morph").mkdir(parents=True)
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.email", "t@example.com"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.name", "t"], cwd=repo, check=True)
+    (repo / "morph" / "agent.py").write_text("x = 1\n")
+    subprocess.run(["git", "add", "-A"], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-qm", "base"], cwd=repo, check=True)
+    base = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+    (repo / "morph" / "calc.py").write_text("def average(values): return 0\n")
+    assert _fixture_leaks(
+        repo,
+        base,
+        "coding/T2/fix-edge-case",
+        ["morph/calc.py"],
+    ) == ["morph/calc.py"]
+    assert _fixture_leaks(
+        repo,
+        base,
+        "coding/T2/fix-edge-case",
+        ["morph/agent.py"],
+    ) == []
 
 
 def test_benchmark_temperature_defaults_to_zero(monkeypatch, tmp_path):

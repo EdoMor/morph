@@ -52,6 +52,11 @@ jobs:
 
       - uses: actions/upload-pages-artifact@v3
         with:
+          # A re-run keeps artifacts from the previous attempt attached to the
+          # same run ID. The default `github-pages` name therefore exists twice
+          # and deploy-pages refuses to guess between them. Include the attempt
+          # so every deployment has exactly one matching artifact.
+          name: github-pages-${{ github.run_id }}-${{ github.run_attempt }}
           path: site
 
   deploy:
@@ -63,6 +68,8 @@ jobs:
     steps:
       - id: deploy
         uses: actions/deploy-pages@v4
+        with:
+          artifact_name: github-pages-${{ github.run_id }}-${{ github.run_attempt }}
 
       - name: Summarise
         run: |

@@ -15,6 +15,7 @@ PROTECTED: tuple[str, ...] = (
     "REQUIREMENTS.md",
     "tests/test_requirements.py",
     "bench/scorecard.py",
+    "bench/runner.py",
     # The whole task suite, not just the scorer. A loop that can author its own
     # benchmark tasks will author easy ones, which is the same failure as editing
     # the scorer, one level down. Growing the benchmark stays a human's job; the

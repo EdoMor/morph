@@ -781,7 +781,13 @@ def test_R_701_loop_is_a_closed_cycle():
     from selfimprove import loop
 
     source = Path(loop.__file__).read_text("utf-8")
-    for stage in ("measure", "build_improvement_prompt", "run_benchmark", "_commit_and_merge"):
+    for stage in (
+        "measure",
+        "build_diagnosis_prompt",
+        "build_implementation_prompt",
+        "_benchmark_subprocess",
+        "_commit_and_merge",
+    ):
         assert stage in source, f"the loop does not reference {stage}"
 
     assert hasattr(loop, "run_iteration")
@@ -1053,6 +1059,7 @@ def test_R_707_goalposts_are_protected(repo_root):
         "REQUIREMENTS.md",
         "tests/test_requirements.py",
         "bench/scorecard.py",
+        "bench/runner.py",
         "bench/tasks",
     ):
         assert required in PROTECTED
@@ -1060,12 +1067,12 @@ def test_R_707_goalposts_are_protected(repo_root):
     assert is_protected("REQUIREMENTS.md")
     assert is_protected("./tests/test_requirements.py")
     assert is_protected("bench/scorecard.py")
+    assert is_protected("bench/runner.py")
     # The whole task package, so the loop cannot author its own easy benchmark.
     assert is_protected("bench/tasks/coding.py")
     assert is_protected("bench/tasks/spec.py")
     assert not is_protected("morph/agent.py")
     assert not is_protected("tests/test_agent.py")
-    assert not is_protected("bench/runner.py")
 
     for path in PROTECTED:
         assert (repo_root / path).exists(), f"protected path {path} does not exist"
@@ -1746,6 +1753,8 @@ def test_R_717_pages_workflow_deploys_and_is_callable(repo_root):
     assert "actions/deploy-pages" in body
     assert "pages: write" in body and "id-token: write" in body
     assert "build_site.py" in body
+    assert "github-pages-${{ github.run_id }}-${{ github.run_attempt }}" in body
+    assert "artifact_name:" in body, "reruns must select their attempt's Pages artifact"
 
     # And the loop refreshes it, and commits the data the site reads.
     improve = (repo_root / ".github" / "workflows" / "self-improve.yml").read_text("utf-8")

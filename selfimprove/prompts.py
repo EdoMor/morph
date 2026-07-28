@@ -58,6 +58,26 @@ Rules:
   history the next iteration reads.
 """
 
+DIAGNOSIS_SYSTEM_PROMPT = """\
+You are the diagnosis stage of Morph's self-improvement loop. You cannot edit
+files in this stage. Inspect the benchmark dossier and Morph's real
+implementation with `read_file` and `grep`, then hand a small, concrete plan to
+the implementation stage.
+
+Benchmark fixtures are evidence from a temporary workspace. They are never
+Morph source files. Do not propose creating a fixture such as `calc.py` under
+`morph/`, and do not propose special-casing fixture symbols such as `average`.
+
+Finish with exactly these headings:
+CAUSE:
+FILES:
+CHANGE:
+TEST:
+Each section should be short and specific. FILES must name existing repository
+files you inspected. If the evidence does not justify a code change, say so
+under CHANGE.
+"""
+
 
 TASK_DEFINITION_FILES = {
     "coding": "bench/tasks/coding.py",
@@ -79,6 +99,20 @@ def select_target(
     targets = list(scorecard.get("next_targets") or [])
     if not targets:
         return None
+
+    # Once the gate is green, prefer an individually re-runnable capability
+    # task. Whole-run metrics such as efficiency/no-timeouts are consequences,
+    # not actionable units of work; run #11 chased one, copied its synthetic
+    # `calc.py` fixture into morph/, and appeared to improve only because the
+    # full model sweep is noisy.
+    if not scorecard.get("gated"):
+        capability = [
+            target
+            for target in targets
+            if str(target.get("category") or "").strip() in TASK_DEFINITION_FILES
+        ]
+        if capability:
+            targets = capability
 
     recent = list(reversed(history))[:8]
     attempted = {
@@ -145,6 +179,122 @@ def _target_brief(target: dict[str, Any] | None) -> str:
             detail[:1800],
         ]
     return "\n".join(lines)
+
+
+def _task_dossier(target: dict[str, Any] | None) -> str:
+    """Render the exact synthetic task into the prompt.
+
+    Telling a 4B model to find a task inside a 900-line definition file was not
+    enough: the warning was separated from the vivid fixture failure by too
+    much context. The loop now extracts the task itself, clearly labels every
+    temporary file, and repeats the boundary beside the evidence.
+    """
+    if not target:
+        return _target_brief(target)
+
+    name = str(target.get("name") or "")
+    try:
+        from bench.tasks import ALL_TASKS
+
+        task = next(item for item in ALL_TASKS if item.label == name)
+    except (ImportError, StopIteration):
+        return _target_brief(target)
+
+    lines = [
+        f"# Benchmark dossier: {task.label}",
+        "",
+        f"Current target score: {float(target.get('score', 0.0)):.0%}",
+        "",
+        "## Prompt given to Morph in the temporary benchmark workspace",
+        "",
+        task.prompt.strip(),
+        "",
+        "## Temporary fixture files",
+        "",
+        "These paths and their symbols are deleted after the benchmark. They are",
+        "**not repository files and must never be created under `morph/`**.",
+    ]
+    for relative, content in task.files.items():
+        lines += [
+            "",
+            f"### fixture `{relative}`",
+            "```text",
+            content[:2400].rstrip(),
+            "```",
+        ]
+
+    lines += ["", "## Rubric"]
+    for criterion in task.rubric.criteria:
+        gate = " (required gate)" if criterion.critical else ""
+        lines.append(f"- {criterion.name}{gate}")
+
+    detail = str(target.get("detail") or "").strip()
+    if detail:
+        lines += [
+            "",
+            "## Observed result from the temporary workspace",
+            "",
+            detail[:2400],
+        ]
+    lines += [
+        "",
+        "## Boundary",
+        "",
+        "Improve the general agent/tool implementation that caused this behavior.",
+        "Do not implement the fixture's requested function inside Morph itself.",
+    ]
+    return "\n".join(lines)
+
+
+def build_diagnosis_prompt(
+    target: dict[str, Any] | None,
+    history: list[dict[str, Any]],
+    focus: str | None = None,
+) -> str:
+    """Small read-only prompt for the archive/diagnosis stage."""
+    sections = [_task_dossier(target)]
+    if history:
+        sections.append(_render_history(history, limit=4))
+    if focus:
+        sections.append(f"# Human focus\n\n{focus}")
+    sections.append(
+        "# Diagnose\n\n"
+        "Use `grep` and `read_file` to inspect the real implementation under "
+        "`morph/`. Identify one general cause of the measured failure and hand "
+        "off one minimal change. Do not edit in this stage."
+    )
+    return "\n\n---\n\n".join(sections)
+
+
+def build_implementation_prompt(
+    target: dict[str, Any] | None,
+    diagnosis: str,
+    focus: str | None = None,
+) -> str:
+    """Focused fresh-context prompt for the code-writing stage."""
+    sections = [
+        "# Implement one measured improvement",
+        _task_dossier(target),
+        (
+            "# Diagnosis handoff\n\n"
+            f"{diagnosis.strip()[:5000] or 'The diagnosis stage produced no usable handoff.'}"
+        ),
+        guard_prompt_section(),
+        (
+            "# Working rules\n\n"
+            "- Inspect every real file before editing it.\n"
+            "- Change the general implementation, never a benchmark fixture.\n"
+            "- Do not create under `morph/` a file whose name appears in the "
+            "temporary fixture list.\n"
+            "- Make one small change. Use `write_file` when creating a file; "
+            "`edit_file` requires all of `path`, `old_string`, and `new_string`.\n"
+            "- Run the narrow affected tests, then `python -m pytest tests -q`.\n"
+            "- Finish with what actually changed and what you ran."
+        ),
+    ]
+    if focus:
+        sections.append(f"# Human focus\n\n{focus}")
+    return "\n\n---\n\n".join(sections)
 
 
 #: The single most expensive misreading available. A capability check named

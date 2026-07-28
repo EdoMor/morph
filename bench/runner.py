@@ -277,6 +277,7 @@ async def run_capability_suites(
     scorecard: Scorecard,
     config: Config,
     only: str | None = None,
+    task_labels: set[str] | None = None,
     tracer: TraceRenderer | None = None,
     progress: ProgressFile | None = None,
 ) -> list[dict[str, Any]]:
@@ -288,6 +289,11 @@ async def run_capability_suites(
     """
     timings: list[dict[str, Any]] = []
     tasks = ALL_TASKS if only is None else SUITES.get(only, [])
+    if task_labels is not None:
+        tasks = [task for task in tasks if task.label in task_labels]
+        missing = task_labels - {task.label for task in tasks}
+        if missing:
+            raise ValueError(f"Unknown benchmark task(s): {', '.join(sorted(missing))}")
     suite = None
 
     for index, task in enumerate(tasks, 1):
@@ -518,6 +524,7 @@ async def run_benchmark(
     repo: Path = REPO_ROOT,
     skip_requirements: bool = False,
     only: str | None = None,
+    task_labels: set[str] | None = None,
     trace: bool = True,
     progress: ProgressFile | None = None,
 ) -> Scorecard:
@@ -535,7 +542,11 @@ async def run_benchmark(
             "image_backend": cfg.image_backend,
             "python": sys.version.split()[0],
             "repo": str(repo),
-            "suites": list(CAPABILITY_CATEGORIES) if only is None else [only],
+            "suites": (
+                sorted(task_labels)
+                if task_labels is not None
+                else (list(CAPABILITY_CATEGORIES) if only is None else [only])
+            ),
             "note": (
                 "provider=echo: capability tasks replay reference traces where one "
                 "exists and are skipped where none does. This measures harness "
@@ -546,7 +557,7 @@ async def run_benchmark(
         }
     )
 
-    if not skip_requirements:
+    if not skip_requirements and task_labels is None:
         if tracer:
             tracer.header("conformance suite")
         run_requirements(scorecard, repo)
@@ -559,10 +570,15 @@ async def run_benchmark(
             )
 
     timings = await run_capability_suites(
-        scorecard, cfg, only=only, tracer=tracer, progress=progress
+        scorecard,
+        cfg,
+        only=only,
+        task_labels=task_labels,
+        tracer=tracer,
+        progress=progress,
     )
 
-    if only is None:
+    if only is None and task_labels is None:
         if tracer:
             tracer.header("robustness")
         await run_robustness(scorecard)
@@ -583,11 +599,18 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--provider", default="echo", help="echo | ollama | google")
     parser.add_argument("--model", default="gemma3:12b")
     parser.add_argument("--base-url")
+    parser.add_argument("--temperature", type=float, default=0.2)
     parser.add_argument("--image-backend", default="stub")
     parser.add_argument(
         "--only",
         choices=sorted(SUITES),
         help="Run a single capability suite (skips requirements and robustness)",
+    )
+    parser.add_argument(
+        "--task",
+        action="append",
+        default=[],
+        help="Run one exact capability task label; may be repeated",
     )
     parser.add_argument(
         "--skip-requirements",
@@ -605,13 +628,20 @@ def main(argv: list[str] | None = None) -> int:
         provider=args.provider,
         model=args.model,
         base_url=args.base_url,
+        temperature=args.temperature,
         image_backend=args.image_backend,
     )
+    task_labels = set(args.task) or None
+    if task_labels is not None and args.only is not None:
+        parser.error("--task and --only cannot be combined")
     scorecard = asyncio.run(
         run_benchmark(
             config,
-            skip_requirements=args.skip_requirements or args.only is not None,
+            skip_requirements=(
+                args.skip_requirements or args.only is not None or task_labels is not None
+            ),
             only=args.only,
+            task_labels=task_labels,
             trace=not args.no_trace,
         )
     )

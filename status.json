@@ -1,0 +1,15 @@
+{
+  "phase": "done",
+  "started_at": 1789287620.971748,
+  "activity": "0/3 accepted",
+  "iterations": 3,
+  "updated_at": 1789292398.466448,
+  "elapsed_s": 4777.5,
+  "iteration": 3,
+  "base_commit": "bb802cdf",
+  "score_before": 61.69,
+  "step": 3,
+  "last_tool_ok": true,
+  "accepted": false,
+  "score_after": 61.69
+}

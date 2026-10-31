@@ -5,7 +5,7 @@
         if not response.tool_calls:
             return response.text
         for call in response.tool_calls:
-            conversation.append(registry.call(call))
+            registry.call('kv_set')
 
 Everything else in Morph — skills, MCP, images, the server, the self-improvement
 loop — is a supplier of tools or context to this loop.

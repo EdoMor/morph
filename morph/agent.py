@@ -5,7 +5,10 @@
         if not response.tool_calls:
             return response.text
         for call in response.tool_calls:
-            registry.call('kv_set')
+            def kv_set(self, data):
+    # This is a placeholder for the actual kv_set implementation
+    print(f'kv_set called with data: {data}')
+    return {'status': 'success'}
 
 Everything else in Morph — skills, MCP, images, the server, the self-improvement
 loop — is a supplier of tools or context to this loop.
